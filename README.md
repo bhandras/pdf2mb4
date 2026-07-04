@@ -1,7 +1,7 @@
-# Resumable Audiobook Pipeline
+# pdf2mb4
 
-Build an audiobook from a scanned PDF with resumable OCR, text cleanup, and
-audio synthesis stages.
+Build a chapterized M4B audiobook from a scanned PDF with resumable OCR, text
+cleanup, chapter detection, and audio synthesis stages.
 
 The preferred entry point is the single-file `uv` script:
 
@@ -13,7 +13,8 @@ OPENAI_API_KEY=... uv run make_audiobook.py book.pdf
 needed Python packages, and runs the pipeline.
 
 Markdown is still produced, but it is an intermediate artifact: the main output
-is a resumable audiobook build.
+is a resumable audiobook build ending in chapter WAV files and, optionally, an
+M4B package.
 
 ## Output
 
