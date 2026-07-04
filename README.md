@@ -124,6 +124,20 @@ Generate only chapter 1:
 uv run make_audiobook.py book.pdf --audio-engine kokoro --voice am_adam --chapters 1
 ```
 
+Chapter announcements are synthesized separately from the chapter body and get
+real silence around them by default: `0.4` seconds before the announcement and
+`1.0` second after it. Tune that spacing when regenerating audio:
+
+```bash
+uv run make_audiobook.py book.pdf \
+  --audio-engine kokoro \
+  --voice am_adam \
+  --chapter-announcement-lead-silence 0.6 \
+  --chapter-announcement-trail-silence 1.4 \
+  --refresh audio \
+  --m4b
+```
+
 ## M4B Packaging
 
 Generate all chapter WAV files and package them into a chapterized M4B:

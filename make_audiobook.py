@@ -187,6 +187,8 @@ class Config:
     mlx_speed: float
     kokoro_language: str | None
     kokoro_speed: float
+    chapter_announcement_lead_silence: float
+    chapter_announcement_trail_silence: float
     m4b: bool
     intro_wavs: tuple[Path, ...]
     cover: Path | None
@@ -340,6 +342,18 @@ def parse_args(argv: list[str]) -> Config:
         help="Kokoro speech speed.",
     )
     parser.add_argument(
+        "--chapter-announcement-lead-silence",
+        type=float,
+        default=0.4,
+        help="Seconds of silence before each chapter announcement.",
+    )
+    parser.add_argument(
+        "--chapter-announcement-trail-silence",
+        type=float,
+        default=1.0,
+        help="Seconds of silence after each chapter announcement.",
+    )
+    parser.add_argument(
         "--m4b",
         action="store_true",
         help="Package per-chapter WAV files into a chapterized audiobook.m4b.",
@@ -424,6 +438,10 @@ def parse_args(argv: list[str]) -> Config:
     args = parser.parse_args(argv)
     if args.mlx_speed <= 0:
         parser.error("--mlx-speed must be greater than 0.")
+    if args.chapter_announcement_lead_silence < 0:
+        parser.error("--chapter-announcement-lead-silence must not be negative.")
+    if args.chapter_announcement_trail_silence < 0:
+        parser.error("--chapter-announcement-trail-silence must not be negative.")
     if args.sample_text is not None and not args.sample_text.strip():
         parser.error("--sample-text must not be empty.")
     if not args.m4b and (args.intro_wav or args.cover):
@@ -451,6 +469,8 @@ def parse_args(argv: list[str]) -> Config:
         mlx_speed=args.mlx_speed,
         kokoro_language=args.kokoro_language,
         kokoro_speed=args.kokoro_speed,
+        chapter_announcement_lead_silence=args.chapter_announcement_lead_silence,
+        chapter_announcement_trail_silence=args.chapter_announcement_trail_silence,
         m4b=args.m4b,
         intro_wavs=tuple(path.expanduser() for path in args.intro_wav),
         cover=args.cover.expanduser() if args.cover else None,
@@ -1166,29 +1186,88 @@ def kokoro_result_audio(result):
     return None
 
 
-def write_kokoro_wav(output_path: Path, text: str, pipeline, config: Config) -> None:
-    import wave
+def split_chapter_announcement(text: str) -> tuple[str, str]:
+    parts = re.split(r"\n\s*\n", text.strip(), maxsplit=1)
+    announcement = parts[0].strip() if parts else ""
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not re.match(r"^chapter\s+\d+\b", announcement, re.IGNORECASE):
+        return "", text.strip()
+    return announcement, body
+
+
+def silence_frame_count(seconds: float, sample_rate: int = 24_000) -> int:
+    return max(0, round(seconds * sample_rate))
+
+
+def write_silence_frames(
+    wav_file: wave.Wave_write,
+    seconds: float,
+    sample_rate: int = 24_000,
+    channels: int = 1,
+    sampwidth: int = 2,
+) -> None:
+    frames = silence_frame_count(seconds, sample_rate)
+    if frames:
+        wav_file.writeframes(b"\0" * frames * channels * sampwidth)
+
+
+def write_silence_wav(path: Path, seconds: float, sample_rate: int = 24_000) -> None:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        write_silence_frames(wav_file, seconds, sample_rate=sample_rate)
+
+
+def write_kokoro_audio_frames(wav_file: wave.Wave_write, text: str, pipeline, config: Config) -> None:
+    if not text.strip():
+        return
 
     import numpy as np
 
+    for result in pipeline(
+        text,
+        voice=config.voice,
+        speed=config.kokoro_speed,
+        split_pattern=r"\n+",
+    ):
+        audio = kokoro_result_audio(result)
+        if audio is None:
+            continue
+        if hasattr(audio, "detach"):
+            audio = audio.detach().cpu().numpy()
+        audio_bytes = (np.asarray(audio) * 32767).astype(np.int16).tobytes()
+        wav_file.writeframes(audio_bytes)
+
+
+def write_kokoro_wav(
+    output_path: Path,
+    text: str,
+    pipeline,
+    config: Config,
+    pad_chapter_announcement: bool = False,
+) -> None:
     with wave.open(str(output_path), "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
-        wav_file.setframerate(24000)
+        wav_file.setframerate(24_000)
 
-        for result in pipeline(
-            text,
-            voice=config.voice,
-            speed=config.kokoro_speed,
-            split_pattern=r"\n+",
-        ):
-            audio = kokoro_result_audio(result)
-            if audio is None:
-                continue
-            if hasattr(audio, "detach"):
-                audio = audio.detach().cpu().numpy()
-            audio_bytes = (np.asarray(audio) * 32767).astype(np.int16).tobytes()
-            wav_file.writeframes(audio_bytes)
+        if pad_chapter_announcement:
+            announcement, body = split_chapter_announcement(text)
+            if announcement:
+                write_silence_frames(
+                    wav_file,
+                    config.chapter_announcement_lead_silence,
+                )
+                write_kokoro_audio_frames(wav_file, announcement, pipeline, config)
+                write_silence_frames(
+                    wav_file,
+                    config.chapter_announcement_trail_silence,
+                )
+                write_kokoro_audio_frames(wav_file, body, pipeline, config)
+                return
+
+        write_kokoro_audio_frames(wav_file, text, pipeline, config)
 
 
 def synthesize_kokoro_chapters(
@@ -1206,6 +1285,8 @@ def synthesize_kokoro_chapters(
         voice=config.voice,
         language=language,
         speed=config.kokoro_speed,
+        announcement_lead_silence=config.chapter_announcement_lead_silence,
+        announcement_trail_silence=config.chapter_announcement_trail_silence,
         chapters=len(chapter_paths),
     )
 
@@ -1230,7 +1311,7 @@ def synthesize_kokoro_chapters(
         print(f"Kokoro chapter {chapter_number:03d}/{len(chapter_paths):03d}...")
         text = chapter_path.read_text(encoding="utf-8").strip()
         with quiet_kokoro_output():
-            write_kokoro_wav(output_path, text, pipeline, config)
+            write_kokoro_wav(output_path, text, pipeline, config, pad_chapter_announcement=True)
         generated_count += 1
         log_event(
             paths,
@@ -1240,6 +1321,8 @@ def synthesize_kokoro_chapters(
             voice=config.voice,
             language=language,
             speed=config.kokoro_speed,
+            announcement_lead_silence=config.chapter_announcement_lead_silence,
+            announcement_trail_silence=config.chapter_announcement_trail_silence,
             characters=len(text),
             bytes=output_path.stat().st_size,
         )
@@ -1378,6 +1461,8 @@ def synthesize_mlx_chatterbox_chapters(
         ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
         max_tokens=config.mlx_max_tokens,
         speed=config.mlx_speed,
+        announcement_lead_silence=config.chapter_announcement_lead_silence,
+        announcement_trail_silence=config.chapter_announcement_trail_silence,
     )
 
     output_paths: list[Path] = []
@@ -1396,8 +1481,39 @@ def synthesize_mlx_chatterbox_chapters(
 
         print(f"MLX Chatterbox chapter {chapter_number:03d}/{len(chapter_paths):03d}...")
         text = chapter_path.read_text(encoding="utf-8").strip()
-        segments = split_text_by_chars(text, config.mlx_chunk_chars)
+        announcement, body = split_chapter_announcement(text)
+        body_text = body if announcement else text
+        segments = split_text_by_chars(body_text, config.mlx_chunk_chars)
         segment_wavs: list[Path] = []
+
+        if announcement:
+            if config.chapter_announcement_lead_silence:
+                lead_silence = scratch_dir / f"chapter_{chapter_number:03d}_lead_silence.wav"
+                write_silence_wav(lead_silence, config.chapter_announcement_lead_silence)
+                segment_wavs.append(lead_silence)
+
+            print(f"MLX Chatterbox chapter {chapter_number:03d} announcement...")
+            before = set(scratch_dir.glob("*.wav"))
+            kwargs = {
+                "text": announcement,
+                "model": config.mlx_model,
+                "file_prefix": f"chapter_{chapter_number:03d}_announcement",
+                "output_path": str(scratch_dir),
+                "max_tokens": config.mlx_max_tokens,
+                "join_audio": True,
+            }
+            if config.mlx_ref_audio:
+                kwargs["ref_audio"] = str(config.mlx_ref_audio)
+            if config.mlx_ref_text:
+                kwargs["ref_text"] = config.mlx_ref_text
+            generate_audio(**kwargs)
+            segment_wavs.append(find_generated_wav(scratch_dir, before))
+
+            if config.chapter_announcement_trail_silence:
+                trail_silence = scratch_dir / f"chapter_{chapter_number:03d}_trail_silence.wav"
+                write_silence_wav(trail_silence, config.chapter_announcement_trail_silence)
+                segment_wavs.append(trail_silence)
+
         for segment_index, segment in enumerate(segments, start=1):
             print(
                 f"MLX Chatterbox chapter {chapter_number:03d} "
@@ -1435,6 +1551,8 @@ def synthesize_mlx_chatterbox_chapters(
             max_tokens=config.mlx_max_tokens,
             chunk_chars=config.mlx_chunk_chars,
             speed=config.mlx_speed,
+            announcement_lead_silence=config.chapter_announcement_lead_silence,
+            announcement_trail_silence=config.chapter_announcement_trail_silence,
             segments=len(segments),
             characters=len(text),
             bytes=output_path.stat().st_size,
@@ -1952,6 +2070,8 @@ def run(config: Config) -> RunPaths:
         mlx_speed=config.mlx_speed,
         kokoro_language=config.kokoro_language,
         kokoro_speed=config.kokoro_speed,
+        chapter_announcement_lead_silence=config.chapter_announcement_lead_silence,
+        chapter_announcement_trail_silence=config.chapter_announcement_trail_silence,
         m4b=config.m4b,
         intro_wavs=[str(path) for path in config.intro_wavs],
         cover=str(config.cover) if config.cover else None,
