@@ -7,6 +7,7 @@
 #   "pillow>=10.0.0",
 #   "tiktoken>=0.7.0",
 #   "kokoro>=0.9.2",
+#   "audiotsm>=0.1.2",
 #   "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git",
 # ]
 # ///
@@ -178,6 +179,7 @@ class Config:
     mlx_ref_text: str | None
     mlx_max_tokens: int
     mlx_chunk_chars: int
+    mlx_speed: float
     kokoro_language: str | None
     kokoro_speed: float
     image_size: int
@@ -299,6 +301,12 @@ def parse_args(argv: list[str]) -> Config:
         help="Approximate text characters per MLX-Audio segment before stitching.",
     )
     parser.add_argument(
+        "--mlx-speed",
+        type=float,
+        default=1.0,
+        help="Post-process MLX Chatterbox audio speed. Use values below 1.0 to slow speech.",
+    )
+    parser.add_argument(
         "--kokoro-language",
         choices=("a", "b", "e", "f", "h", "i", "p", "j", "z"),
         help="Kokoro language code. Defaults to the first character of the Kokoro voice.",
@@ -356,6 +364,8 @@ def parse_args(argv: list[str]) -> Config:
     )
 
     args = parser.parse_args(argv)
+    if args.mlx_speed <= 0:
+        parser.error("--mlx-speed must be greater than 0.")
     voice = args.voice or (DEFAULT_KOKORO_VOICE if args.audio_engine == "kokoro" else DEFAULT_VOICE)
     chapters = parse_chapter_selection(args.chapters)
     return Config(
@@ -372,6 +382,7 @@ def parse_args(argv: list[str]) -> Config:
         mlx_ref_text=args.mlx_ref_text,
         mlx_max_tokens=args.mlx_max_tokens,
         mlx_chunk_chars=args.mlx_chunk_chars,
+        mlx_speed=args.mlx_speed,
         kokoro_language=args.kokoro_language,
         kokoro_speed=args.kokoro_speed,
         image_size=args.image_size,
@@ -1226,6 +1237,29 @@ def patch_transformers_string_tokenizer_registration() -> None:
     AutoTokenizer.register = safe_register
 
 
+def time_stretch_wav(input_path: Path, speed: float) -> None:
+    if abs(speed - 1.0) < 0.001:
+        return
+
+    from audiotsm import wsola
+    from audiotsm.io.wav import WavReader, WavWriter
+
+    temp_path = input_path.with_suffix(f".speed-{speed:g}.tmp.wav")
+    try:
+        with wave.open(str(input_path), "rb") as wav_file:
+            if wav_file.getsampwidth() != 2:
+                raise RuntimeError(
+                    f"Cannot time-stretch {input_path}; expected 16-bit WAV."
+                )
+        with WavReader(str(input_path)) as reader:
+            with WavWriter(str(temp_path), reader.channels, reader.samplerate) as writer:
+                wsola(reader.channels, speed=speed).run(reader, writer)
+        temp_path.replace(input_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def synthesize_mlx_chatterbox_chapters(
     config: Config, paths: RunPaths, chapter_paths: Iterable[Path]
 ) -> list[Path]:
@@ -1247,6 +1281,7 @@ def synthesize_mlx_chatterbox_chapters(
         chapters=len(chapter_paths),
         ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
         max_tokens=config.mlx_max_tokens,
+        speed=config.mlx_speed,
     )
 
     output_paths: list[Path] = []
@@ -1290,6 +1325,9 @@ def synthesize_mlx_chatterbox_chapters(
             segment_wavs.append(find_generated_wav(scratch_dir, before))
 
         concatenate_wavs(segment_wavs, output_path)
+        if abs(config.mlx_speed - 1.0) >= 0.001:
+            print(f"Adjusting MLX Chatterbox chapter speed to {config.mlx_speed:g}x...")
+            time_stretch_wav(output_path, config.mlx_speed)
         generated_count += 1
         log_event(
             paths,
@@ -1300,6 +1338,7 @@ def synthesize_mlx_chatterbox_chapters(
             ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
             max_tokens=config.mlx_max_tokens,
             chunk_chars=config.mlx_chunk_chars,
+            speed=config.mlx_speed,
             segments=len(segments),
             characters=len(text),
             bytes=output_path.stat().st_size,

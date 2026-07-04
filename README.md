@@ -120,8 +120,10 @@ reference clip is not required.
 uv run make_audiobook.py book.pdf \
   --audio-engine mlx-chatterbox \
   --chapters 1 \
+  --mlx-speed 0.88 \
   --mlx-chunk-chars 350 \
-  --mlx-max-tokens 4000
+  --mlx-max-tokens 4000 \
+  --refresh audio
 ```
 
 For voice cloning, pass a short reference WAV and its transcript with
@@ -131,6 +133,8 @@ audio.
 
 Chatterbox output is written to `output/book/chapter_audio/mlx-chatterbox/`.
 Long chapters are split into smaller MLX-Audio segments and stitched into one
-chapter WAV to avoid single-call truncation. This backend is much slower than
-Kokoro in local testing, so start with a short sample before regenerating a full
-chapter.
+chapter WAV to avoid single-call truncation. `--mlx-speed` post-processes the
+chapter WAV after generation; values below `1.0` slow speech while preserving
+pitch. Use `--refresh audio` when changing speed for an already-generated
+chapter. This backend is much slower than Kokoro in local testing, so start with
+a short sample before regenerating a full chapter.
