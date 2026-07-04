@@ -45,7 +45,9 @@ Chapter detection is based on the raw OCR pages, then validated against page
 order and chapter sequence before headings are inserted into the final
 `audiobook_text.md`. This keeps narration chapter markers even when the cleanup
 stage removes or normalizes them. The cleaned page files are also repaired from
-the validated chapter list so chapter titles remain visible during audits.
+the validated chapter list so chapter titles remain visible during audits. If no
+chapters are detected, the whole narration is synthesized as one book-level WAV
+and the M4B is packaged without chapter markers.
 
 The cost report uses actual token usage returned by text/vision API calls and a
 small rate table sourced from OpenAI's published pricing page. It separates the

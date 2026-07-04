@@ -971,6 +971,19 @@ def filter_chapter_paths(chapter_paths: Iterable[Path], chapters: tuple[int, ...
     return filtered
 
 
+def selected_audio_text_paths(
+    paths: RunPaths, config: Config, chapters: list[Chapter]
+) -> list[Path]:
+    if chapters:
+        return filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
+    if config.chapters:
+        selected = ", ".join(str(chapter) for chapter in config.chapters)
+        raise RuntimeError(
+            f"Cannot synthesize chapter(s) {selected}; no chapters were detected."
+        )
+    return [paths.audiobook_text]
+
+
 def write_chapter_texts(
     page_paths: list[Path],
     chapters: list[Chapter],
@@ -986,12 +999,22 @@ def write_chapter_texts(
         output=str(output_path),
     )
     if not chapters:
-        merge_pages(page_paths, output_path, paths)
+        for stale_chapter in chapter_dir.glob("chapter_*.md"):
+            stale_chapter.unlink()
+        page_texts = [
+            page_path.read_text(encoding="utf-8").strip()
+            for page_path in page_paths
+        ]
+        book_text = "\n\n".join(text for text in page_texts if text).strip()
+        output_path.write_text(book_text + "\n", encoding="utf-8")
+        print(f"Audiobook text written to {output_path}")
+        print("No chapters detected; using one book-level audio file.")
         log_event(
             paths,
             "stage_completed",
             stage="write_chapter_texts",
             chapters=0,
+            book_level_audio=True,
             output=str(output_path),
         )
         return output_path
@@ -1277,7 +1300,7 @@ def synthesize_kokoro_chapters(
     output_dir = paths.chapter_audio / "kokoro"
     output_dir.mkdir(parents=True, exist_ok=True)
     language = kokoro_language_for(config)
-    print(f"Synthesizing {len(chapter_paths)} Kokoro chapter WAV(s)...")
+    print(f"Synthesizing {len(chapter_paths)} Kokoro audio WAV(s)...")
     log_event(
         paths,
         "stage_started",
@@ -1300,18 +1323,33 @@ def synthesize_kokoro_chapters(
 
     for chapter_path in chapter_paths:
         match = re.search(r"chapter_(\d+)", chapter_path.stem)
-        chapter_number = int(match.group(1)) if match else len(output_paths) + 1
-        output_path = output_dir / f"chapter_{chapter_number:03d}.wav"
+        chapter_number = int(match.group(1)) if match else None
+        output_path = (
+            output_dir / f"chapter_{chapter_number:03d}.wav"
+            if chapter_number is not None
+            else output_dir / "book.wav"
+        )
         output_paths.append(output_path)
 
         if output_path.exists() and not should_refresh(config, "audio"):
             reused_count += 1
             continue
 
-        print(f"Kokoro chapter {chapter_number:03d}/{len(chapter_paths):03d}...")
+        label = (
+            f"chapter {chapter_number:03d}"
+            if chapter_number is not None
+            else "book"
+        )
+        print(f"Kokoro {label} ({len(output_paths):03d}/{len(chapter_paths):03d})...")
         text = chapter_path.read_text(encoding="utf-8").strip()
         with quiet_kokoro_output():
-            write_kokoro_wav(output_path, text, pipeline, config, pad_chapter_announcement=True)
+            write_kokoro_wav(
+                output_path,
+                text,
+                pipeline,
+                config,
+                pad_chapter_announcement=chapter_number is not None,
+            )
         generated_count += 1
         log_event(
             paths,
@@ -1451,7 +1489,7 @@ def synthesize_mlx_chatterbox_chapters(
     output_dir.mkdir(parents=True, exist_ok=True)
     scratch_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Synthesizing {len(chapter_paths)} MLX Chatterbox chapter WAV(s)...")
+    print(f"Synthesizing {len(chapter_paths)} MLX Chatterbox audio WAV(s)...")
     log_event(
         paths,
         "stage_started",
@@ -1471,17 +1509,26 @@ def synthesize_mlx_chatterbox_chapters(
 
     for chapter_path in chapter_paths:
         match = re.search(r"chapter_(\d+)", chapter_path.stem)
-        chapter_number = int(match.group(1)) if match else len(output_paths) + 1
-        output_path = output_dir / f"chapter_{chapter_number:03d}.wav"
+        chapter_number = int(match.group(1)) if match else None
+        output_path = (
+            output_dir / f"chapter_{chapter_number:03d}.wav"
+            if chapter_number is not None
+            else output_dir / "book.wav"
+        )
         output_paths.append(output_path)
 
         if output_path.exists() and not should_refresh(config, "audio"):
             reused_count += 1
             continue
 
-        print(f"MLX Chatterbox chapter {chapter_number:03d}/{len(chapter_paths):03d}...")
+        label = (
+            f"chapter {chapter_number:03d}"
+            if chapter_number is not None
+            else "book"
+        )
+        print(f"MLX Chatterbox {label} ({len(output_paths):03d}/{len(chapter_paths):03d})...")
         text = chapter_path.read_text(encoding="utf-8").strip()
-        announcement, body = split_chapter_announcement(text)
+        announcement, body = split_chapter_announcement(text) if chapter_number is not None else ("", text)
         body_text = body if announcement else text
         segments = split_text_by_chars(body_text, config.mlx_chunk_chars)
         segment_wavs: list[Path] = []
@@ -1625,11 +1672,13 @@ def chapter_number_from_audio_path(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def m4b_chapter_title(chapter_number: int, chapters: list[Chapter]) -> str:
+def m4b_chapter_title(chapter_number: int, chapters: list[Chapter], config: Config) -> str:
     for chapter in chapters:
         if chapter.number == chapter_number:
             title = chapter.title.strip()
             return f"Chapter {chapter.number}: {title}" if title else f"Chapter {chapter.number}"
+    if chapter_number == 1 and not chapters and config.pdf:
+        return config.pdf.stem.replace("_", " ")
     return f"Chapter {chapter_number}"
 
 
@@ -1644,26 +1693,32 @@ def m4b_escape(value: str) -> str:
     return "".join(escaped)
 
 
-def write_m4b_metadata(paths: RunPaths, config: Config, tracks: list[AudioTrack]) -> None:
+def write_m4b_metadata(
+    paths: RunPaths,
+    config: Config,
+    tracks: list[AudioTrack],
+    include_chapters: bool,
+) -> None:
     start_ms = 0
     lines = [
         ";FFMETADATA1",
         f"title={m4b_escape(config.pdf.stem.replace('_', ' ') if config.pdf else 'Audiobook')}",
         "genre=Audiobook",
     ]
-    for track in tracks:
-        end_ms = max(start_ms + track.duration_ms, start_ms + 1)
-        lines.extend(
-            [
-                "",
-                "[CHAPTER]",
-                "TIMEBASE=1/1000",
-                f"START={start_ms}",
-                f"END={end_ms}",
-                f"title={m4b_escape(track.title)}",
-            ]
-        )
-        start_ms = end_ms
+    if include_chapters:
+        for track in tracks:
+            end_ms = max(start_ms + track.duration_ms, start_ms + 1)
+            lines.extend(
+                [
+                    "",
+                    "[CHAPTER]",
+                    "TIMEBASE=1/1000",
+                    f"START={start_ms}",
+                    f"END={end_ms}",
+                    f"title={m4b_escape(track.title)}",
+                ]
+            )
+            start_ms = end_ms
     paths.m4b_metadata.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1694,9 +1749,13 @@ def chapter_audio_dir_for_engine(paths: RunPaths, config: Config) -> Path:
 def discover_chapter_audio_paths(paths: RunPaths, config: Config) -> list[Path]:
     audio_dir = chapter_audio_dir_for_engine(paths, config)
     chapter_paths = filter_chapter_paths(audio_dir.glob("chapter_*.wav"), config.chapters)
+    if not chapter_paths and not config.chapters:
+        book_path = audio_dir / "book.wav"
+        if book_path.exists():
+            return [book_path]
     if not chapter_paths:
         raise RuntimeError(
-            f"No chapter WAV files found in {audio_dir}. Generate chapter audio first."
+            f"No chapter or book WAV files found in {audio_dir}. Generate audio first."
         )
     return chapter_paths
 
@@ -1726,7 +1785,7 @@ def build_m4b(
     for chapter_wav in chapter_audio_paths:
         chapter_number = chapter_number_from_audio_path(chapter_wav)
         title = (
-            m4b_chapter_title(chapter_number, chapters)
+            m4b_chapter_title(chapter_number, chapters, config)
             if chapter_number is not None
             else pretty_title_from_path(chapter_wav)
         )
@@ -1735,7 +1794,7 @@ def build_m4b(
     if not tracks:
         raise RuntimeError("No audio tracks were provided for M4B packaging.")
 
-    write_m4b_metadata(paths, config, tracks)
+    write_m4b_metadata(paths, config, tracks, include_chapters=bool(chapters))
     cover_path = normalize_cover_for_m4b(config, paths, default_cover)
 
     import imageio_ffmpeg
@@ -2104,11 +2163,11 @@ def run(config: Config) -> RunPaths:
     chapter_audio_paths: list[Path] = []
     if not config.text_only:
         if config.audio_engine == "kokoro":
-            chapter_paths = filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
-            chapter_audio_paths = synthesize_kokoro_chapters(config, paths, chapter_paths)
+            audio_text_paths = selected_audio_text_paths(paths, config, chapters)
+            chapter_audio_paths = synthesize_kokoro_chapters(config, paths, audio_text_paths)
         elif config.audio_engine == "mlx-chatterbox":
-            chapter_paths = filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
-            chapter_audio_paths = synthesize_mlx_chatterbox_chapters(config, paths, chapter_paths)
+            audio_text_paths = selected_audio_text_paths(paths, config, chapters)
+            chapter_audio_paths = synthesize_mlx_chatterbox_chapters(config, paths, audio_text_paths)
         else:
             client = make_client()
             final_text = audiobook_text.read_text(encoding="utf-8")
