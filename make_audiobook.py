@@ -413,7 +413,7 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument(
         "--refresh",
         action="append",
-        choices=("ocr", "clean", "audio", "m4b", "all"),
+        choices=("ocr", "clean", "audio", "all"),
         default=[],
         help="Regenerate one cached stage without rebuilding the whole pipeline.",
     )
@@ -1570,19 +1570,6 @@ def build_m4b(
     chapter_audio_paths = list(chapter_audio_paths)
     if not chapter_audio_paths:
         chapter_audio_paths = discover_chapter_audio_paths(paths, config)
-
-    if paths.m4b.exists() and not (
-        should_refresh(config, "m4b") or should_refresh(config, "audio")
-    ):
-        log_event(
-            paths,
-            "stage_skipped",
-            stage="build_m4b",
-            reason="cached",
-            output=str(paths.m4b),
-        )
-        print(f"M4B already exists at {paths.m4b}")
-        return paths.m4b
 
     for intro_wav in config.intro_wavs:
         if not intro_wav.exists():

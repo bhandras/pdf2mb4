@@ -56,7 +56,7 @@ dashboard or organization Costs endpoint, especially for audio generation.
 `run_manifest.jsonl` is append-only and records major pipeline events as they
 happen: run start/completion, stage start/completion/skips, rendered pages, OCR
 pages, cleaned pages, chapter detection, chapter text creation, TTS chunks, WAV
-concatenation, and cost report creation.
+concatenation, M4B packaging, and cost report creation.
 
 ## Meaningful Options
 
@@ -150,8 +150,9 @@ uv run make_audiobook.py book.pdf \
   --cover cover.jpg
 ```
 
-If chapter WAV files already exist, reruns reuse them. Use `--refresh m4b` to
-rebuild only the M4B package after changing intro files, cover art, or bitrate.
+If chapter WAV files already exist, reruns reuse them. When `--m4b` is present,
+the M4B package is rebuilt every time so changes to intro files, cover art,
+bitrate, or chapter metadata are picked up without an extra refresh flag.
 
 ## MLX-Audio Chatterbox
 
