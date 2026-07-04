@@ -113,40 +113,21 @@ uv run make_audiobook.py book.pdf --audio-engine kokoro --voice am_adam --chapte
 ## MLX-Audio Chatterbox
 
 `mlx-chatterbox` uses `mlx-audio` with the `mlx-community/chatterbox-fp16`
-model. Chatterbox supports voice cloning through a reference WAV, so a practical
-comparison is to generate a short male Kokoro reference and then use that as the
-Chatterbox reference. Keep the reference clip short and pass its exact transcript;
-using a full chapter as the reference can produce unusable audio.
+model. It can synthesize speech with the model's shipped conditionals, so a
+reference clip is not required.
 
 ```bash
-uv run --with kokoro --with numpy python - <<'PY'
-from pathlib import Path
-import wave
-import numpy as np
-from kokoro import KPipeline
-
-out = Path("output/book/voice_refs/kokoro_am_adam_reference.wav")
-out.parent.mkdir(parents=True, exist_ok=True)
-text = "This is a clean male reference voice for chapter narration. The pacing should be calm, clear, and steady."
-pipeline = KPipeline(lang_code="a")
-audio = np.concatenate([np.asarray(a, dtype=np.float32) for _, _, a in pipeline(text, voice="am_adam")])
-pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
-with wave.open(str(out), "wb") as wav:
-    wav.setnchannels(1)
-    wav.setsampwidth(2)
-    wav.setframerate(24000)
-    wav.writeframes(pcm.tobytes())
-PY
-
 uv run make_audiobook.py book.pdf \
   --audio-engine mlx-chatterbox \
   --chapters 1 \
-  --voice am_adam \
   --mlx-chunk-chars 350 \
-  --mlx-max-tokens 4000 \
-  --mlx-ref-audio output/book/voice_refs/kokoro_am_adam_reference.wav \
-  --mlx-ref-text "This is a clean male reference voice for chapter narration. The pacing should be calm, clear, and steady."
+  --mlx-max-tokens 4000
 ```
+
+For voice cloning, pass a short reference WAV and its transcript with
+`--mlx-ref-audio` and `--mlx-ref-text`. Keep the reference clip short and
+transcript-matched; using a full chapter as the reference can produce unusable
+audio.
 
 Chatterbox output is written to `output/book/chapter_audio/mlx-chatterbox/`.
 Long chapters are split into smaller MLX-Audio segments and stitched into one

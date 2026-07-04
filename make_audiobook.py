@@ -176,7 +176,6 @@ class Config:
     mlx_model: str
     mlx_ref_audio: Path | None
     mlx_ref_text: str | None
-    mlx_lang_code: str
     mlx_max_tokens: int
     mlx_chunk_chars: int
     kokoro_language: str | None
@@ -288,11 +287,6 @@ def parse_args(argv: list[str]) -> Config:
         help="Transcript for the Chatterbox reference WAV.",
     )
     parser.add_argument(
-        "--mlx-lang-code",
-        default="en",
-        help="Language code for Chatterbox generation.",
-    )
-    parser.add_argument(
         "--mlx-max-tokens",
         type=int,
         default=4_000,
@@ -376,7 +370,6 @@ def parse_args(argv: list[str]) -> Config:
         mlx_model=args.mlx_model,
         mlx_ref_audio=args.mlx_ref_audio.expanduser() if args.mlx_ref_audio else None,
         mlx_ref_text=args.mlx_ref_text,
-        mlx_lang_code=args.mlx_lang_code,
         mlx_max_tokens=args.mlx_max_tokens,
         mlx_chunk_chars=args.mlx_chunk_chars,
         kokoro_language=args.kokoro_language,
@@ -1253,9 +1246,7 @@ def synthesize_mlx_chatterbox_chapters(
         model=config.mlx_model,
         chapters=len(chapter_paths),
         ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
-        lang_code=config.mlx_lang_code,
         max_tokens=config.mlx_max_tokens,
-        voice=config.voice,
     )
 
     output_paths: list[Path] = []
@@ -1287,9 +1278,6 @@ def synthesize_mlx_chatterbox_chapters(
                 "model": config.mlx_model,
                 "file_prefix": f"chapter_{chapter_number:03d}_part_{segment_index:03d}",
                 "output_path": str(scratch_dir),
-                "lang_code": config.mlx_lang_code,
-                "voice": config.voice,
-                "speed": config.kokoro_speed,
                 "max_tokens": config.mlx_max_tokens,
                 "join_audio": True,
             }
@@ -1309,9 +1297,7 @@ def synthesize_mlx_chatterbox_chapters(
             chapter=chapter_number,
             file=str(output_path),
             model=config.mlx_model,
-            voice=config.voice,
             ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
-            lang_code=config.mlx_lang_code,
             max_tokens=config.mlx_max_tokens,
             chunk_chars=config.mlx_chunk_chars,
             segments=len(segments),
@@ -1563,7 +1549,6 @@ def run(config: Config) -> RunPaths:
         chapters=list(config.chapters),
         mlx_model=config.mlx_model,
         mlx_ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
-        mlx_lang_code=config.mlx_lang_code,
         mlx_max_tokens=config.mlx_max_tokens,
         kokoro_language=config.kokoro_language,
         kokoro_speed=config.kokoro_speed,
