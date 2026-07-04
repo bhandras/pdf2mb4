@@ -8,6 +8,7 @@
 #   "tiktoken>=0.7.0",
 #   "kokoro>=0.9.2",
 #   "audiotsm>=0.1.2",
+#   "imageio-ffmpeg>=0.5.1",
 #   "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git",
 # ]
 # ///
@@ -30,6 +31,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import wave
@@ -182,6 +184,11 @@ class Config:
     mlx_speed: float
     kokoro_language: str | None
     kokoro_speed: float
+    m4b: bool
+    intro_wavs: tuple[Path, ...]
+    cover: Path | None
+    no_cover: bool
+    m4b_bitrate: str
     image_size: int
     raw_ocr: bool
     text_only: bool
@@ -202,6 +209,9 @@ class RunPaths:
     cleaned_book: Path
     audiobook_text: Path
     audiobook: Path
+    m4b: Path
+    m4b_metadata: Path
+    m4b_cover: Path
     chapters: Path
     chapter_texts: Path
     cost_report: Path
@@ -215,6 +225,13 @@ class Chapter:
     title: str
     source_file: str
     raw_heading: str
+
+
+@dataclass(frozen=True)
+class AudioTrack:
+    title: str
+    path: Path
+    duration_ms: int
 
 
 def parse_chapter_selection(value: str | None) -> tuple[int, ...]:
@@ -318,6 +335,33 @@ def parse_args(argv: list[str]) -> Config:
         help="Kokoro speech speed.",
     )
     parser.add_argument(
+        "--m4b",
+        action="store_true",
+        help="Package per-chapter WAV files into a chapterized audiobook.m4b.",
+    )
+    parser.add_argument(
+        "--intro-wav",
+        action="append",
+        type=Path,
+        default=[],
+        help="Intro WAV to prepend to the M4B. Can be used more than once.",
+    )
+    parser.add_argument(
+        "--cover",
+        type=Path,
+        help="Cover image to attach to the M4B. Defaults to the first rendered PDF page.",
+    )
+    parser.add_argument(
+        "--no-cover",
+        action="store_true",
+        help="Do not attach cover art to the M4B.",
+    )
+    parser.add_argument(
+        "--m4b-bitrate",
+        default="64k",
+        help="AAC audio bitrate for M4B packaging.",
+    )
+    parser.add_argument(
         "--list-voices",
         action="store_true",
         help="List known Kokoro voice IDs and exit.",
@@ -358,7 +402,7 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument(
         "--refresh",
         action="append",
-        choices=("ocr", "clean", "audio", "all"),
+        choices=("ocr", "clean", "audio", "m4b", "all"),
         default=[],
         help="Regenerate one cached stage without rebuilding the whole pipeline.",
     )
@@ -366,6 +410,8 @@ def parse_args(argv: list[str]) -> Config:
     args = parser.parse_args(argv)
     if args.mlx_speed <= 0:
         parser.error("--mlx-speed must be greater than 0.")
+    if not args.m4b and (args.intro_wav or args.cover):
+        args.m4b = True
     voice = args.voice or (DEFAULT_KOKORO_VOICE if args.audio_engine == "kokoro" else DEFAULT_VOICE)
     chapters = parse_chapter_selection(args.chapters)
     return Config(
@@ -385,6 +431,11 @@ def parse_args(argv: list[str]) -> Config:
         mlx_speed=args.mlx_speed,
         kokoro_language=args.kokoro_language,
         kokoro_speed=args.kokoro_speed,
+        m4b=args.m4b,
+        intro_wavs=tuple(path.expanduser() for path in args.intro_wav),
+        cover=args.cover.expanduser() if args.cover else None,
+        no_cover=args.no_cover,
+        m4b_bitrate=args.m4b_bitrate,
         image_size=args.image_size,
         raw_ocr=args.raw_ocr,
         text_only=args.text_only,
@@ -415,6 +466,9 @@ def make_paths(config: Config) -> RunPaths:
         cleaned_book=root / "cleaned_book.md",
         audiobook_text=root / "audiobook_text.md",
         audiobook=root / "audiobook.wav",
+        m4b=root / "audiobook.m4b",
+        m4b_metadata=root / "audiobook.ffmetadata",
+        m4b_cover=root / "audiobook_cover.jpg",
         chapters=root / "chapters.json",
         chapter_texts=root / "chapters",
         cost_report=root / "cost_report.json",
@@ -1396,6 +1450,244 @@ def concatenate_wavs(chunk_paths: Iterable[Path], output_path: Path, paths: RunP
         )
 
 
+def wav_duration_ms(path: Path) -> int:
+    with wave.open(str(path), "rb") as wav_file:
+        return round(wav_file.getnframes() * 1000 / wav_file.getframerate())
+
+
+def pretty_title_from_path(path: Path) -> str:
+    title = re.sub(r"[_-]+", " ", path.stem).strip()
+    return title.title() if title else path.stem
+
+
+def chapter_number_from_audio_path(path: Path) -> int | None:
+    match = re.search(r"chapter_(\d+)", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def m4b_chapter_title(chapter_number: int, chapters: list[Chapter]) -> str:
+    for chapter in chapters:
+        if chapter.number == chapter_number:
+            title = chapter.title.strip()
+            return f"Chapter {chapter.number}: {title}" if title else f"Chapter {chapter.number}"
+    return f"Chapter {chapter_number}"
+
+
+def m4b_escape(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    escaped = []
+    for char in value:
+        if char in "\\=;#":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def write_m4b_metadata(paths: RunPaths, config: Config, tracks: list[AudioTrack]) -> None:
+    start_ms = 0
+    lines = [
+        ";FFMETADATA1",
+        f"title={m4b_escape(config.pdf.stem.replace('_', ' ') if config.pdf else 'Audiobook')}",
+        "genre=Audiobook",
+    ]
+    for track in tracks:
+        end_ms = max(start_ms + track.duration_ms, start_ms + 1)
+        lines.extend(
+            [
+                "",
+                "[CHAPTER]",
+                "TIMEBASE=1/1000",
+                f"START={start_ms}",
+                f"END={end_ms}",
+                f"title={m4b_escape(track.title)}",
+            ]
+        )
+        start_ms = end_ms
+    paths.m4b_metadata.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def normalize_cover_for_m4b(
+    config: Config, paths: RunPaths, default_cover: Path | None
+) -> Path | None:
+    if config.no_cover:
+        return None
+    cover_source = config.cover or default_cover
+    if not cover_source:
+        return None
+    if not cover_source.exists():
+        raise FileNotFoundError(f"Cover image does not exist: {cover_source}")
+
+    with Image.open(cover_source) as image:
+        image = image.convert("RGB")
+        image.thumbnail((1600, 1600))
+        image.save(paths.m4b_cover, "JPEG", quality=90, optimize=True)
+    return paths.m4b_cover
+
+
+def chapter_audio_dir_for_engine(paths: RunPaths, config: Config) -> Path:
+    if config.audio_engine not in {"kokoro", "mlx-chatterbox"}:
+        raise RuntimeError("--m4b requires --audio-engine kokoro or mlx-chatterbox.")
+    return paths.chapter_audio / config.audio_engine
+
+
+def discover_chapter_audio_paths(paths: RunPaths, config: Config) -> list[Path]:
+    audio_dir = chapter_audio_dir_for_engine(paths, config)
+    chapter_paths = filter_chapter_paths(audio_dir.glob("chapter_*.wav"), config.chapters)
+    if not chapter_paths:
+        raise RuntimeError(
+            f"No chapter WAV files found in {audio_dir}. Generate chapter audio first."
+        )
+    return chapter_paths
+
+
+def build_m4b(
+    config: Config,
+    paths: RunPaths,
+    chapters: list[Chapter],
+    chapter_audio_paths: Iterable[Path],
+    default_cover: Path | None,
+) -> Path:
+    chapter_audio_paths = list(chapter_audio_paths)
+    if not chapter_audio_paths:
+        chapter_audio_paths = discover_chapter_audio_paths(paths, config)
+
+    if paths.m4b.exists() and not (
+        should_refresh(config, "m4b") or should_refresh(config, "audio")
+    ):
+        log_event(
+            paths,
+            "stage_skipped",
+            stage="build_m4b",
+            reason="cached",
+            output=str(paths.m4b),
+        )
+        print(f"M4B already exists at {paths.m4b}")
+        return paths.m4b
+
+    for intro_wav in config.intro_wavs:
+        if not intro_wav.exists():
+            raise FileNotFoundError(f"Intro WAV does not exist: {intro_wav}")
+
+    tracks: list[AudioTrack] = []
+    for index, intro_wav in enumerate(config.intro_wavs, start=1):
+        title = pretty_title_from_path(intro_wav)
+        if len(config.intro_wavs) > 1:
+            title = f"Intro {index}: {title}"
+        tracks.append(AudioTrack(title=title, path=intro_wav, duration_ms=wav_duration_ms(intro_wav)))
+
+    for chapter_wav in chapter_audio_paths:
+        chapter_number = chapter_number_from_audio_path(chapter_wav)
+        title = (
+            m4b_chapter_title(chapter_number, chapters)
+            if chapter_number is not None
+            else pretty_title_from_path(chapter_wav)
+        )
+        tracks.append(AudioTrack(title=title, path=chapter_wav, duration_ms=wav_duration_ms(chapter_wav)))
+
+    if not tracks:
+        raise RuntimeError("No audio tracks were provided for M4B packaging.")
+
+    write_m4b_metadata(paths, config, tracks)
+    cover_path = normalize_cover_for_m4b(config, paths, default_cover)
+
+    import imageio_ffmpeg
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    temp_output = paths.m4b.with_suffix(".tmp.m4b")
+    temp_output.unlink(missing_ok=True)
+
+    cmd = [ffmpeg, "-hide_banner", "-y"]
+    for track in tracks:
+        cmd.extend(["-i", str(track.path)])
+    metadata_input = len(tracks)
+    cmd.extend(["-f", "ffmetadata", "-i", str(paths.m4b_metadata)])
+
+    cover_input = None
+    if cover_path:
+        cover_input = metadata_input + 1
+        cmd.extend(["-i", str(cover_path)])
+
+    filter_parts = []
+    for index in range(len(tracks)):
+        filter_parts.append(
+            f"[{index}:a]aresample=24000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=mono[a{index}]"
+        )
+    concat_inputs = "".join(f"[a{index}]" for index in range(len(tracks)))
+    filter_parts.append(f"{concat_inputs}concat=n={len(tracks)}:v=0:a=1[a]")
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[a]",
+        ]
+    )
+    if cover_input is not None:
+        cmd.extend(
+            [
+                "-map",
+                f"{cover_input}:v:0",
+                "-c:v",
+                "copy",
+                "-disposition:v:0",
+                "attached_pic",
+                "-metadata:s:v",
+                "title=Cover",
+                "-metadata:s:v",
+                "comment=Cover (front)",
+            ]
+        )
+    cmd.extend(
+        [
+            "-map_metadata",
+            str(metadata_input),
+            "-map_chapters",
+            str(metadata_input),
+            "-c:a",
+            "aac",
+            "-b:a",
+            config.m4b_bitrate,
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+    )
+
+    print(f"Writing M4B to {paths.m4b}...")
+    log_event(
+        paths,
+        "stage_started",
+        stage="build_m4b",
+        tracks=len(tracks),
+        chapters=len(chapter_audio_paths),
+        intros=len(config.intro_wavs),
+        cover=str(cover_path) if cover_path else None,
+        bitrate=config.m4b_bitrate,
+        output=str(paths.m4b),
+    )
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        temp_output.unlink(missing_ok=True)
+        stderr = completed.stderr.strip()
+        raise RuntimeError(f"ffmpeg failed while writing M4B:\n{stderr[-4000:]}")
+
+    temp_output.replace(paths.m4b)
+    log_event(
+        paths,
+        "stage_completed",
+        stage="build_m4b",
+        tracks=len(tracks),
+        chapters=len(chapter_audio_paths),
+        intros=len(config.intro_wavs),
+        output=str(paths.m4b),
+        bytes=paths.m4b.stat().st_size,
+    )
+    print(f"M4B written to {paths.m4b}")
+    return paths.m4b
+
+
 def token_usage_cost(model: str, usage: dict) -> float | None:
     prices = MODEL_PRICES_USD_PER_1M.get(model)
     if not prices:
@@ -1545,8 +1837,19 @@ def write_cost_report(paths: RunPaths) -> None:
 
 
 def write_config(paths: RunPaths, config: Config) -> None:
+    def json_value(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return [json_value(item) for item in value]
+        if isinstance(value, list):
+            return [json_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: json_value(item) for key, item in value.items()}
+        return value
+
     serializable = {
-        key: str(value) if isinstance(value, Path) else value
+        key: json_value(value)
         for key, value in asdict(config).items()
     }
     (paths.root / "config.json").write_text(
@@ -1571,6 +1874,8 @@ def run(config: Config) -> RunPaths:
         raise FileNotFoundError(f"PDF does not exist: {config.pdf}")
     if config.image_size < 256:
         raise ValueError("--image-size must be at least 256.")
+    if config.m4b and config.audio_engine not in {"kokoro", "mlx-chatterbox"}:
+        raise ValueError("--m4b requires --audio-engine kokoro or mlx-chatterbox.")
 
     paths = make_paths(config)
     ensure_dirs(paths)
@@ -1589,8 +1894,14 @@ def run(config: Config) -> RunPaths:
         mlx_model=config.mlx_model,
         mlx_ref_audio=str(config.mlx_ref_audio) if config.mlx_ref_audio else None,
         mlx_max_tokens=config.mlx_max_tokens,
+        mlx_speed=config.mlx_speed,
         kokoro_language=config.kokoro_language,
         kokoro_speed=config.kokoro_speed,
+        m4b=config.m4b,
+        intro_wavs=[str(path) for path in config.intro_wavs],
+        cover=str(config.cover) if config.cover else None,
+        no_cover=config.no_cover,
+        m4b_bitrate=config.m4b_bitrate,
         text_only=config.text_only,
         raw_ocr=config.raw_ocr,
         overwrite=config.overwrite,
@@ -1615,13 +1926,14 @@ def run(config: Config) -> RunPaths:
         paths,
     )
 
+    chapter_audio_paths: list[Path] = []
     if not config.text_only:
         if config.audio_engine == "kokoro":
             chapter_paths = filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
-            synthesize_kokoro_chapters(config, paths, chapter_paths)
+            chapter_audio_paths = synthesize_kokoro_chapters(config, paths, chapter_paths)
         elif config.audio_engine == "mlx-chatterbox":
             chapter_paths = filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
-            synthesize_mlx_chatterbox_chapters(config, paths, chapter_paths)
+            chapter_audio_paths = synthesize_mlx_chatterbox_chapters(config, paths, chapter_paths)
         else:
             client = make_client()
             final_text = audiobook_text.read_text(encoding="utf-8")
@@ -1630,6 +1942,14 @@ def run(config: Config) -> RunPaths:
     else:
         log_event(paths, "stage_skipped", stage="synthesize_audio", reason="text_only")
         log_event(paths, "stage_skipped", stage="concatenate_audio", reason="text_only")
+
+    if config.m4b:
+        if not chapter_audio_paths:
+            chapter_audio_paths = discover_chapter_audio_paths(paths, config)
+        default_cover = image_paths[0] if image_paths else None
+        build_m4b(config, paths, chapters, chapter_audio_paths, default_cover)
+    else:
+        log_event(paths, "stage_skipped", stage="build_m4b", reason="m4b_disabled")
 
     write_cost_report(paths)
     log_event(paths, "run_completed", output=str(paths.root))
