@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import io
 import json
 import os
@@ -34,6 +35,7 @@ import re
 import subprocess
 import sys
 import time
+import warnings
 import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -50,6 +52,7 @@ DEFAULT_CLEAN_MODEL = "gpt-5.4-nano"
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_VOICE = "alloy"
 DEFAULT_KOKORO_VOICE = "am_adam"
+KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
 DEFAULT_MLX_CHATTERBOX_MODEL = "mlx-community/chatterbox-fp16"
 DEFAULT_IMAGE_SIZE = 1024
 MAX_TTS_TOKENS = 1800
@@ -1137,6 +1140,24 @@ def kokoro_language_for(config: Config) -> str:
     return config.kokoro_language or config.voice[0].lower()
 
 
+@contextlib.contextmanager
+def quiet_kokoro_output():
+    old_progress = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\..*")
+            warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\..*")
+            warnings.filterwarnings("ignore", message=r".*unauthenticated requests.*")
+            with contextlib.redirect_stderr(io.StringIO()):
+                yield
+    finally:
+        if old_progress is None:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        else:
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = old_progress
+
+
 def kokoro_result_audio(result):
     if hasattr(result, "audio"):
         return result.audio
@@ -1173,8 +1194,6 @@ def write_kokoro_wav(output_path: Path, text: str, pipeline, config: Config) -> 
 def synthesize_kokoro_chapters(
     config: Config, paths: RunPaths, chapter_paths: Iterable[Path]
 ) -> list[Path]:
-    from kokoro import KPipeline
-
     chapter_paths = list(chapter_paths)
     output_dir = paths.chapter_audio / "kokoro"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1190,7 +1209,10 @@ def synthesize_kokoro_chapters(
         chapters=len(chapter_paths),
     )
 
-    pipeline = KPipeline(lang_code=language)
+    with quiet_kokoro_output():
+        from kokoro import KPipeline
+
+        pipeline = KPipeline(lang_code=language, repo_id=KOKORO_REPO_ID)
     output_paths: list[Path] = []
     generated_count = 0
     reused_count = 0
@@ -1207,7 +1229,8 @@ def synthesize_kokoro_chapters(
 
         print(f"Kokoro chapter {chapter_number:03d}/{len(chapter_paths):03d}...")
         text = chapter_path.read_text(encoding="utf-8").strip()
-        write_kokoro_wav(output_path, text, pipeline, config)
+        with quiet_kokoro_output():
+            write_kokoro_wav(output_path, text, pipeline, config)
         generated_count += 1
         log_event(
             paths,
@@ -1887,13 +1910,14 @@ def generate_kokoro_sample(config: Config) -> Path:
     if config.sample_text is None:
         raise ValueError("--sample-text is required.")
 
-    from kokoro import KPipeline
-
     output_path = sample_output_path(config)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     language = kokoro_language_for(config)
-    pipeline = KPipeline(lang_code=language)
-    write_kokoro_wav(output_path, config.sample_text.strip(), pipeline, config)
+    with quiet_kokoro_output():
+        from kokoro import KPipeline
+
+        pipeline = KPipeline(lang_code=language, repo_id=KOKORO_REPO_ID)
+        write_kokoro_wav(output_path, config.sample_text.strip(), pipeline, config)
     print(f"Kokoro sample written to {output_path}")
     return output_path
 
