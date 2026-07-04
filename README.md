@@ -82,6 +82,17 @@ List known Kokoro voice IDs:
 uv run make_audiobook.py --list-voices
 ```
 
+Generate a short voice sample without processing a PDF:
+
+```bash
+uv run make_audiobook.py \
+  --voice af_nicole \
+  --sample-text "This is a short narration sample for choosing an audiobook voice."
+```
+
+Samples are written to `voice_samples/` by default. Use `--sample-output` to
+choose a specific WAV path or output directory.
+
 Generate a separate WAV file for each detected chapter:
 
 ```bash

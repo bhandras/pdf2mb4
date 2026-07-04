@@ -189,6 +189,8 @@ class Config:
     cover: Path | None
     no_cover: bool
     m4b_bitrate: str
+    sample_text: str | None
+    sample_output: Path | None
     image_size: int
     raw_ocr: bool
     text_only: bool
@@ -362,6 +364,15 @@ def parse_args(argv: list[str]) -> Config:
         help="AAC audio bitrate for M4B packaging.",
     )
     parser.add_argument(
+        "--sample-text",
+        help="Generate a short Kokoro voice sample from this text and exit.",
+    )
+    parser.add_argument(
+        "--sample-output",
+        type=Path,
+        help="Sample WAV path or directory. Defaults to voice_samples/<voice>.wav.",
+    )
+    parser.add_argument(
         "--list-voices",
         action="store_true",
         help="List known Kokoro voice IDs and exit.",
@@ -410,9 +421,15 @@ def parse_args(argv: list[str]) -> Config:
     args = parser.parse_args(argv)
     if args.mlx_speed <= 0:
         parser.error("--mlx-speed must be greater than 0.")
+    if args.sample_text is not None and not args.sample_text.strip():
+        parser.error("--sample-text must not be empty.")
     if not args.m4b and (args.intro_wav or args.cover):
         args.m4b = True
-    voice = args.voice or (DEFAULT_KOKORO_VOICE if args.audio_engine == "kokoro" else DEFAULT_VOICE)
+    voice = args.voice or (
+        DEFAULT_KOKORO_VOICE
+        if args.audio_engine == "kokoro" or args.sample_text is not None
+        else DEFAULT_VOICE
+    )
     chapters = parse_chapter_selection(args.chapters)
     return Config(
         pdf=args.pdf.expanduser() if args.pdf else None,
@@ -436,6 +453,8 @@ def parse_args(argv: list[str]) -> Config:
         cover=args.cover.expanduser() if args.cover else None,
         no_cover=args.no_cover,
         m4b_bitrate=args.m4b_bitrate,
+        sample_text=args.sample_text,
+        sample_output=args.sample_output.expanduser() if args.sample_output else None,
         image_size=args.image_size,
         raw_ocr=args.raw_ocr,
         text_only=args.text_only,
@@ -1867,6 +1886,31 @@ def print_kokoro_voices() -> None:
     print("\nKokoro also supports comma-separated voice blends, such as af_bella,af_nicole.")
 
 
+def sample_output_path(config: Config) -> Path:
+    voice_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", config.voice).strip("_") or "voice"
+    default_name = f"kokoro_{voice_slug}.wav"
+    if config.sample_output:
+        if config.sample_output.suffix.lower() == ".wav":
+            return config.sample_output
+        return config.sample_output / default_name
+    return Path("voice_samples") / default_name
+
+
+def generate_kokoro_sample(config: Config) -> Path:
+    if config.sample_text is None:
+        raise ValueError("--sample-text is required.")
+
+    from kokoro import KPipeline
+
+    output_path = sample_output_path(config)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    language = kokoro_language_for(config)
+    pipeline = KPipeline(lang_code=language)
+    write_kokoro_wav(output_path, config.sample_text.strip(), pipeline, config)
+    print(f"Kokoro sample written to {output_path}")
+    return output_path
+
+
 def run(config: Config) -> RunPaths:
     if config.pdf is None:
         raise ValueError("A PDF path is required. Use --list-voices without a PDF to list Kokoro voices.")
@@ -1960,6 +2004,16 @@ def main(argv: list[str] | None = None) -> int:
     config = parse_args(sys.argv[1:] if argv is None else argv)
     if config.list_voices:
         print_kokoro_voices()
+        return 0
+    if config.sample_text is not None:
+        try:
+            generate_kokoro_sample(config)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            return 130
+        except Exception as exc:  # noqa: BLE001 - CLI should show concise failures.
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         return 0
     try:
         paths = run(config)
