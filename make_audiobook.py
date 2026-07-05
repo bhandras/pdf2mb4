@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import difflib
 import io
 import json
 import os
@@ -145,6 +146,8 @@ Convert this scanned book page to Markdown.
 Rules:
 - Transcribe the page; do not summarize or add commentary.
 - Preserve paragraphs, headings, lists, emphasis, and obvious scene breaks.
+- Preserve table-of-contents lines and chapter-opening lines as written,
+  including bare numbered chapter headings such as "1" followed by a title.
 - Omit page numbers, running headers, and running footers when they are not part
   of the book text.
 - Never turn a standalone page number into a chapter heading.
@@ -161,6 +164,9 @@ Rules:
 - If the page begins with a chapter heading and chapter title, keep both at the
   top. Chapter titles are part of the audiobook structure and must not be
   removed.
+- Some books use bare numbered chapter openers, such as "1" followed by the
+  title on the next line. Preserve those opener numbers and title lines instead
+  of dropping them or turning them into ordinary section headings.
 - Remove scanning artifacts, page numbers, running headers, running footers,
   footnote markers, and anything that should not be read aloud.
 - Do not summarize, modernize, censor, or add commentary.
@@ -230,6 +236,24 @@ class Chapter:
     number: int
     page: int
     title: str
+    source_file: str
+    raw_heading: str
+
+
+@dataclass(frozen=True)
+class TocEntry:
+    number: int
+    title: str
+    source_file: str
+    source_page: int
+    raw_line: str
+    printed_page: int | None = None
+
+
+@dataclass(frozen=True)
+class FrontMatterSection:
+    title: str
+    page: int
     source_file: str
     raw_heading: str
 
@@ -786,6 +810,217 @@ def clean_title(text: str) -> str:
     return text.strip(":- ")
 
 
+def plain_markdown_line(text: str) -> str:
+    text = re.sub(r"^\s*#{1,6}\s*", "", text.strip())
+    text = re.sub(r"[*_`]+", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" :-")
+
+
+def normalize_match_text(text: str) -> str:
+    text = plain_markdown_line(text).lower()
+    text = text.replace("’", "'").replace("‘", "'")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def cleaned_toc_title(raw_title: str, printed_page: int | None) -> str:
+    title = raw_title
+    if printed_page is not None:
+        title = re.sub(rf"\s+{printed_page}\s*$", "", title)
+    title = re.sub(r"\.{2,}\s*\d+\s*$", "", title)
+    title = re.sub(r"\s+\d{1,4}\s*$", "", title)
+    return clean_title(plain_markdown_line(title))
+
+
+def looks_like_toc_page(lines: list[str], page: int) -> bool:
+    if page > 40:
+        return False
+
+    plain_lines = [plain_markdown_line(line) for line in lines[:30] if line.strip()]
+    has_contents_heading = any(
+        line.lower() in {"contents", "table of contents"} for line in plain_lines[:8]
+    )
+    numbered_entries = sum(
+        1
+        for line in plain_lines
+        if re.match(r"^\d{1,3}[.)]?\s+\S+", line)
+    )
+    entry_numbers = [
+        int(match.group(1))
+        for line in plain_lines
+        if (match := re.match(r"^(\d{1,3})[.)]?\s+\S+", line))
+    ]
+    starts_like_toc = 1 in entry_numbers and 2 in entry_numbers
+    return has_contents_heading or (numbered_entries >= 3 and starts_like_toc)
+
+
+def extract_toc_entries(markdown_paths: Iterable[Path]) -> list[TocEntry]:
+    entries: list[TocEntry] = []
+    seen_numbers: set[int] = set()
+
+    for markdown_path in sorted(markdown_paths):
+        page = page_number_from_path(markdown_path)
+        lines = markdown_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if not looks_like_toc_page(lines, page):
+            continue
+
+        for raw_line in lines:
+            line = plain_markdown_line(raw_line)
+            match = re.match(
+                r"^(?P<number>\d{1,3})[.)]?\s+"
+                r"(?P<title>.+?)"
+                r"(?:\s+\.{2,}\s*|\s+)?"
+                r"(?P<printed_page>\d{1,4})?\s*$",
+                line,
+            )
+            if not match:
+                continue
+
+            number = int(match.group("number"))
+            printed_page = (
+                int(match.group("printed_page"))
+                if match.group("printed_page")
+                else None
+            )
+            title = cleaned_toc_title(match.group("title"), printed_page)
+            normalized_title = normalize_match_text(title)
+            if (
+                number in seen_numbers
+                or number <= 0
+                or number > 100
+                or len(normalized_title) < 6
+                or normalized_title in {"contents", "index"}
+            ):
+                continue
+
+            seen_numbers.add(number)
+            entries.append(
+                TocEntry(
+                    number=number,
+                    title=title,
+                    source_file=str(markdown_path),
+                    source_page=page,
+                    raw_line=raw_line.strip(),
+                    printed_page=printed_page,
+                )
+            )
+
+    return sorted(entries, key=lambda entry: entry.number)
+
+
+def page_opener_lines(markdown_path: Path) -> list[str]:
+    lines = markdown_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    clean_lines: list[str] = []
+    for line in lines:
+        if line.strip().startswith("```"):
+            continue
+        cleaned = plain_markdown_line(line)
+        if cleaned:
+            clean_lines.append(cleaned)
+        if len(clean_lines) >= 12:
+            break
+    return clean_lines
+
+
+def toc_entry_match_score(entry: TocEntry, opener_lines: list[str]) -> tuple[float, str]:
+    if not opener_lines:
+        return 0.0, ""
+
+    title = normalize_match_text(entry.title)
+    joined = normalize_match_text(" ".join(opener_lines[:8]))
+    if not title or not joined:
+        return 0.0, ""
+
+    best_line_ratio = max(
+        difflib.SequenceMatcher(None, title, normalize_match_text(line)).ratio()
+        for line in opener_lines[:8]
+    )
+    title_words = set(title.split())
+    joined_words = set(joined.split())
+    word_coverage = len(title_words & joined_words) / max(len(title_words), 1)
+
+    title_score = 0.0
+    if title in joined:
+        title_score = 5.0
+    elif best_line_ratio >= 0.88:
+        title_score = 4.0
+    elif word_coverage >= 0.78:
+        title_score = 3.0
+
+    number_score = 0.0
+    for index, line in enumerate(opener_lines[:4]):
+        if re.fullmatch(rf"{entry.number}[.)]?", line):
+            number_score = 3.0 if index <= 1 else 1.5
+            break
+
+    # Running headers often repeat only the title. Prefer true opener pages when
+    # a numbered chapter marker is present, while still allowing chapter 1 in
+    # books whose first opener omits the number.
+    if title_score and (number_score or entry.number == 1):
+        score = title_score + number_score
+    elif title_score >= 4.0:
+        score = title_score - 1.0
+    else:
+        score = 0.0
+
+    heading_preview = " / ".join(opener_lines[:6])
+    if len(heading_preview) > 360:
+        heading_preview = heading_preview[:357].rstrip() + "..."
+    return score, heading_preview
+
+
+def detect_chapters_from_toc(
+    entries: list[TocEntry],
+    markdown_paths: list[Path],
+) -> list[Chapter]:
+    if not entries:
+        return []
+
+    path_pages = [(page_number_from_path(path), path) for path in sorted(markdown_paths)]
+    toc_pages = {entry.source_page for entry in entries}
+    accepted: list[Chapter] = []
+    min_page = 1
+
+    for entry in entries:
+        best_score = 0.0
+        best_page: int | None = None
+        best_path: Path | None = None
+        best_heading = ""
+
+        for page, markdown_path in path_pages:
+            if page < min_page or page in toc_pages:
+                continue
+
+            opener_lines = page_opener_lines(markdown_path)
+            if looks_like_toc_page(opener_lines, page):
+                continue
+
+            score, raw_heading = toc_entry_match_score(entry, opener_lines)
+            if score > best_score:
+                best_score = score
+                best_page = page
+                best_path = markdown_path
+                best_heading = raw_heading
+
+        if best_path is None or best_page is None or best_score < 4.0:
+            continue
+
+        accepted.append(
+            Chapter(
+                number=entry.number,
+                page=best_page,
+                title=entry.title,
+                source_file=str(best_path),
+                raw_heading=best_heading,
+            )
+        )
+        min_page = best_page + 1
+
+    return validate_chapter_candidates(accepted)
+
+
 def find_chapter_candidate(markdown_path: Path) -> Chapter | None:
     lines = markdown_path.read_text(encoding="utf-8", errors="ignore").splitlines()
     nonempty = [(index, line.strip()) for index, line in enumerate(lines) if line.strip()]
@@ -859,17 +1094,26 @@ def validate_chapter_candidates(candidates: Iterable[Chapter]) -> list[Chapter]:
 
 def detect_chapters(markdown_paths: Iterable[Path], paths: RunPaths) -> list[Chapter]:
     log_event(paths, "stage_started", stage="detect_chapters")
+    markdown_paths = sorted(markdown_paths)
     candidates = [
         candidate
         for markdown_path in markdown_paths
         if (candidate := find_chapter_candidate(markdown_path)) is not None
     ]
     chapters = validate_chapter_candidates(candidates)
+    toc_entries = extract_toc_entries(markdown_paths)
+    toc_chapters: list[Chapter] = []
+    if not chapters and toc_entries:
+        toc_chapters = detect_chapters_from_toc(toc_entries, markdown_paths)
+        chapters = toc_chapters
+
     payload = {
         "chapters": [asdict(chapter) for chapter in chapters],
         "rejected_candidates": [
             asdict(candidate) for candidate in candidates if candidate not in chapters
         ],
+        "toc_entries": [asdict(entry) for entry in toc_entries],
+        "toc_detected_chapters": [asdict(chapter) for chapter in toc_chapters],
     }
     paths.chapters.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -882,6 +1126,8 @@ def detect_chapters(markdown_paths: Iterable[Path], paths: RunPaths) -> list[Cha
         stage="detect_chapters",
         chapters=len(chapters),
         candidates=len(candidates),
+        toc_entries=len(toc_entries),
+        toc_detected_chapters=len(toc_chapters),
         rejected=len(candidates) - len(chapters),
         output=str(paths.chapters),
     )
@@ -894,20 +1140,165 @@ def chapter_heading(chapter: Chapter) -> str:
     return f"Chapter {chapter.number}"
 
 
+FRONT_MATTER_HEADINGS = {
+    "foreword": "Foreword",
+    "forward": "Foreword",
+    "preface": "Preface",
+    "introduction": "Introduction",
+    "intro": "Introduction",
+    "prologue": "Prologue",
+    "author s note": "Author's Note",
+    "author note": "Author's Note",
+    "note to the reader": "Note to the Reader",
+}
+
+
+def front_matter_title_from_line(line: str) -> str | None:
+    cleaned = normalize_match_text(line)
+    if cleaned in FRONT_MATTER_HEADINGS:
+        return FRONT_MATTER_HEADINGS[cleaned]
+
+    for key, title in FRONT_MATTER_HEADINGS.items():
+        if cleaned.startswith(key + " ") and len(cleaned.split()) <= len(key.split()) + 3:
+            return title
+    return None
+
+
+def record_front_matter_metadata(
+    paths: RunPaths, front_matter: FrontMatterSection | None
+) -> None:
+    try:
+        payload = json.loads(paths.chapters.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {}
+
+    payload["front_matter"] = asdict(front_matter) if front_matter else None
+    if front_matter:
+        payload["narration_start_page"] = front_matter.page
+        payload["narration_start_title"] = front_matter.title
+    else:
+        payload.pop("narration_start_page", None)
+        payload.pop("narration_start_title", None)
+
+    paths.chapters.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def detect_front_matter_section(
+    markdown_paths: Iterable[Path], chapters: list[Chapter], paths: RunPaths
+) -> FrontMatterSection | None:
+    log_event(paths, "stage_started", stage="detect_front_matter")
+    first_chapter_page = min((chapter.page for chapter in chapters), default=None)
+    search_limit = min(first_chapter_page - 1, 60) if first_chapter_page else 60
+    front_matter: FrontMatterSection | None = None
+
+    for markdown_path in sorted(markdown_paths):
+        page = page_number_from_path(markdown_path)
+        if page > search_limit:
+            continue
+        if first_chapter_page and page >= first_chapter_page:
+            continue
+
+        lines = page_opener_lines(markdown_path)
+        if looks_like_toc_page(lines, page):
+            continue
+
+        for line in lines[:4]:
+            title = front_matter_title_from_line(line)
+            if not title:
+                continue
+            front_matter = FrontMatterSection(
+                title=title,
+                page=page,
+                source_file=str(markdown_path),
+                raw_heading=line,
+            )
+            break
+
+        if front_matter:
+            break
+
+    record_front_matter_metadata(paths, front_matter)
+    if front_matter:
+        print(
+            f"Detected audiobook start at page {front_matter.page}: "
+            f"{front_matter.title}."
+        )
+    log_event(
+        paths,
+        "stage_completed",
+        stage="detect_front_matter",
+        detected=front_matter is not None,
+        page=front_matter.page if front_matter else None,
+        title=front_matter.title if front_matter else None,
+    )
+    return front_matter
+
+
 def strip_leading_chapter_heading(text: str, chapter: Chapter) -> str:
     lines = text.splitlines()
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    if lines and re.match(r"^#*\s*chapter\s+\d+\b", lines[0].strip(), re.IGNORECASE):
-        lines.pop(0)
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    if chapter.title and lines:
-        possible_title = clean_title(lines[0])
-        if possible_title.lower() == chapter.title.lower():
+
+    def trim_blank_prefix() -> None:
+        while lines and not lines[0].strip():
             lines.pop(0)
-    while lines and not lines[0].strip():
-        lines.pop(0)
+
+    def pop_chapter_marker() -> bool:
+        if lines and re.match(
+            r"^#*\s*chapter\s+\d+\b", lines[0].strip(), re.IGNORECASE
+        ):
+            lines.pop(0)
+            return True
+        if lines and re.fullmatch(
+            rf"#*\s*{chapter.number}[.)]?\s*", lines[0].strip()
+        ):
+            lines.pop(0)
+            return True
+        return False
+
+    def pop_title_block() -> bool:
+        if not chapter.title or not lines:
+            return False
+
+        title = normalize_match_text(chapter.title)
+        title_words = set(title.split())
+        consumed = 0
+        for index in range(min(6, len(lines))):
+            candidate_lines = [plain_markdown_line(line) for line in lines[: index + 1]]
+            candidate = normalize_match_text(" ".join(candidate_lines))
+            if not candidate:
+                consumed = index + 1
+                continue
+            candidate_words = set(candidate.split())
+            word_coverage = len(title_words & candidate_words) / max(len(title_words), 1)
+            if (
+                candidate == title
+                or title in candidate
+                or (title.endswith(candidate) and len(candidate) >= 6)
+                or (
+                    title.startswith(candidate)
+                    and len(candidate) >= max(8, int(len(title) * 0.7))
+                )
+                or word_coverage >= 0.85
+            ):
+                consumed = index + 1
+                break
+
+        if consumed:
+            del lines[:consumed]
+            return True
+        return False
+
+    for _ in range(2):
+        trim_blank_prefix()
+        changed = pop_chapter_marker()
+        trim_blank_prefix()
+        changed = pop_title_block() or changed
+        trim_blank_prefix()
+        if not changed:
+            break
+
     return "\n".join(lines).strip()
 
 
@@ -975,7 +1366,15 @@ def selected_audio_text_paths(
     paths: RunPaths, config: Config, chapters: list[Chapter]
 ) -> list[Path]:
     if chapters:
-        return filter_chapter_paths(paths.chapter_texts.glob("chapter_*.md"), config.chapters)
+        chapter_paths = filter_chapter_paths(
+            paths.chapter_texts.glob("chapter_*.md"), config.chapters
+        )
+        if config.chapters:
+            return chapter_paths
+        front_matter_path = paths.chapter_texts / "front_matter.md"
+        if front_matter_path.exists():
+            return [front_matter_path, *chapter_paths]
+        return chapter_paths
     if config.chapters:
         selected = ", ".join(str(chapter) for chapter in config.chapters)
         raise RuntimeError(
@@ -984,9 +1383,23 @@ def selected_audio_text_paths(
     return [paths.audiobook_text]
 
 
+def strip_leading_section_heading(text: str, title: str) -> str:
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    if lines and normalize_match_text(lines[0]) == normalize_match_text(title):
+        lines.pop(0)
+
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 def write_chapter_texts(
     page_paths: list[Path],
     chapters: list[Chapter],
+    front_matter: FrontMatterSection | None,
     output_path: Path,
     chapter_dir: Path,
     paths: RunPaths,
@@ -996,16 +1409,27 @@ def write_chapter_texts(
         "stage_started",
         stage="write_chapter_texts",
         chapters=len(chapters),
+        front_matter=front_matter.title if front_matter else None,
         output=str(output_path),
     )
+    pages_by_number = {page_number_from_path(path): path for path in page_paths}
+    sorted_pages = sorted(pages_by_number)
+
     if not chapters:
         for stale_chapter in chapter_dir.glob("chapter_*.md"):
             stale_chapter.unlink()
+        (chapter_dir / "front_matter.md").unlink(missing_ok=True)
+        start_page = front_matter.page if front_matter else None
         page_texts = [
-            page_path.read_text(encoding="utf-8").strip()
-            for page_path in page_paths
+            pages_by_number[page].read_text(encoding="utf-8").strip()
+            for page in sorted_pages
+            if start_page is None or page >= start_page
         ]
         book_text = "\n\n".join(text for text in page_texts if text).strip()
+        if front_matter and book_text:
+            book_text = f"{front_matter.title}\n\n" + strip_leading_section_heading(
+                book_text, front_matter.title
+            )
         output_path.write_text(book_text + "\n", encoding="utf-8")
         print(f"Audiobook text written to {output_path}")
         print("No chapters detected; using one book-level audio file.")
@@ -1014,14 +1438,36 @@ def write_chapter_texts(
             "stage_completed",
             stage="write_chapter_texts",
             chapters=0,
+            front_matter=front_matter.title if front_matter else None,
+            start_page=start_page,
             book_level_audio=True,
             output=str(output_path),
         )
         return output_path
 
-    pages_by_number = {page_number_from_path(path): path for path in page_paths}
-    sorted_pages = sorted(pages_by_number)
     chapter_parts: list[str] = []
+
+    front_matter_file = chapter_dir / "front_matter.md"
+    if front_matter:
+        first_chapter_page = min(chapter.page for chapter in chapters)
+        front_pages = [
+            page
+            for page in sorted_pages
+            if front_matter.page <= page < first_chapter_page
+        ]
+        body_parts = []
+        for page in front_pages:
+            text = pages_by_number[page].read_text(encoding="utf-8").strip()
+            if page == front_matter.page:
+                text = strip_leading_section_heading(text, front_matter.title)
+            if text:
+                body_parts.append(text)
+        front_text = f"{front_matter.title}\n\n" + "\n\n".join(body_parts).strip()
+        front_text = front_text.strip() + "\n"
+        front_matter_file.write_text(front_text, encoding="utf-8")
+        chapter_parts.append(front_text.strip())
+    else:
+        front_matter_file.unlink(missing_ok=True)
 
     for index, chapter in enumerate(chapters):
         next_page = chapters[index + 1].page if index + 1 < len(chapters) else None
@@ -1051,6 +1497,7 @@ def write_chapter_texts(
         "stage_completed",
         stage="write_chapter_texts",
         chapters=len(chapters),
+        front_matter=front_matter.title if front_matter else None,
         chapter_files=len(chapter_parts),
         output=str(output_path),
     )
@@ -1293,6 +1740,16 @@ def write_kokoro_wav(
         write_kokoro_audio_frames(wav_file, text, pipeline, config)
 
 
+def audio_output_path_for_text_path(
+    output_dir: Path, paths: RunPaths, text_path: Path, chapter_number: int | None
+) -> Path:
+    if chapter_number is not None:
+        return output_dir / f"chapter_{chapter_number:03d}.wav"
+    if text_path == paths.audiobook_text:
+        return output_dir / "book.wav"
+    return output_dir / f"{text_path.stem}.wav"
+
+
 def synthesize_kokoro_chapters(
     config: Config, paths: RunPaths, chapter_paths: Iterable[Path]
 ) -> list[Path]:
@@ -1324,10 +1781,8 @@ def synthesize_kokoro_chapters(
     for chapter_path in chapter_paths:
         match = re.search(r"chapter_(\d+)", chapter_path.stem)
         chapter_number = int(match.group(1)) if match else None
-        output_path = (
-            output_dir / f"chapter_{chapter_number:03d}.wav"
-            if chapter_number is not None
-            else output_dir / "book.wav"
+        output_path = audio_output_path_for_text_path(
+            output_dir, paths, chapter_path, chapter_number
         )
         output_paths.append(output_path)
 
@@ -1338,7 +1793,7 @@ def synthesize_kokoro_chapters(
         label = (
             f"chapter {chapter_number:03d}"
             if chapter_number is not None
-            else "book"
+            else pretty_title_from_path(chapter_path)
         )
         print(f"Kokoro {label} ({len(output_paths):03d}/{len(chapter_paths):03d})...")
         text = chapter_path.read_text(encoding="utf-8").strip()
@@ -1510,23 +1965,27 @@ def synthesize_mlx_chatterbox_chapters(
     for chapter_path in chapter_paths:
         match = re.search(r"chapter_(\d+)", chapter_path.stem)
         chapter_number = int(match.group(1)) if match else None
-        output_path = (
-            output_dir / f"chapter_{chapter_number:03d}.wav"
-            if chapter_number is not None
-            else output_dir / "book.wav"
+        output_path = audio_output_path_for_text_path(
+            output_dir, paths, chapter_path, chapter_number
         )
         output_paths.append(output_path)
+        track_label = (
+            f"chapter {chapter_number:03d}"
+            if chapter_number is not None
+            else pretty_title_from_path(chapter_path).lower()
+        )
+        track_prefix = (
+            f"chapter_{chapter_number:03d}"
+            if chapter_number is not None
+            else re.sub(r"[^a-z0-9]+", "_", chapter_path.stem.lower()).strip("_")
+            or "section"
+        )
 
         if output_path.exists() and not should_refresh(config, "audio"):
             reused_count += 1
             continue
 
-        label = (
-            f"chapter {chapter_number:03d}"
-            if chapter_number is not None
-            else "book"
-        )
-        print(f"MLX Chatterbox {label} ({len(output_paths):03d}/{len(chapter_paths):03d})...")
+        print(f"MLX Chatterbox {track_label} ({len(output_paths):03d}/{len(chapter_paths):03d})...")
         text = chapter_path.read_text(encoding="utf-8").strip()
         announcement, body = split_chapter_announcement(text) if chapter_number is not None else ("", text)
         body_text = body if announcement else text
@@ -1535,16 +1994,16 @@ def synthesize_mlx_chatterbox_chapters(
 
         if announcement:
             if config.chapter_announcement_lead_silence:
-                lead_silence = scratch_dir / f"chapter_{chapter_number:03d}_lead_silence.wav"
+                lead_silence = scratch_dir / f"{track_prefix}_lead_silence.wav"
                 write_silence_wav(lead_silence, config.chapter_announcement_lead_silence)
                 segment_wavs.append(lead_silence)
 
-            print(f"MLX Chatterbox chapter {chapter_number:03d} announcement...")
+            print(f"MLX Chatterbox {track_label} announcement...")
             before = set(scratch_dir.glob("*.wav"))
             kwargs = {
                 "text": announcement,
                 "model": config.mlx_model,
-                "file_prefix": f"chapter_{chapter_number:03d}_announcement",
+                "file_prefix": f"{track_prefix}_announcement",
                 "output_path": str(scratch_dir),
                 "max_tokens": config.mlx_max_tokens,
                 "join_audio": True,
@@ -1557,20 +2016,20 @@ def synthesize_mlx_chatterbox_chapters(
             segment_wavs.append(find_generated_wav(scratch_dir, before))
 
             if config.chapter_announcement_trail_silence:
-                trail_silence = scratch_dir / f"chapter_{chapter_number:03d}_trail_silence.wav"
+                trail_silence = scratch_dir / f"{track_prefix}_trail_silence.wav"
                 write_silence_wav(trail_silence, config.chapter_announcement_trail_silence)
                 segment_wavs.append(trail_silence)
 
         for segment_index, segment in enumerate(segments, start=1):
             print(
-                f"MLX Chatterbox chapter {chapter_number:03d} "
+                f"MLX Chatterbox {track_label} "
                 f"segment {segment_index:02d}/{len(segments):02d}..."
             )
             before = set(scratch_dir.glob("*.wav"))
             kwargs = {
                 "text": segment,
                 "model": config.mlx_model,
-                "file_prefix": f"chapter_{chapter_number:03d}_part_{segment_index:03d}",
+                "file_prefix": f"{track_prefix}_part_{segment_index:03d}",
                 "output_path": str(scratch_dir),
                 "max_tokens": config.mlx_max_tokens,
                 "join_audio": True,
@@ -1749,6 +2208,11 @@ def chapter_audio_dir_for_engine(paths: RunPaths, config: Config) -> Path:
 def discover_chapter_audio_paths(paths: RunPaths, config: Config) -> list[Path]:
     audio_dir = chapter_audio_dir_for_engine(paths, config)
     chapter_paths = filter_chapter_paths(audio_dir.glob("chapter_*.wav"), config.chapters)
+    if chapter_paths and not config.chapters:
+        front_matter_path = audio_dir / "front_matter.wav"
+        if front_matter_path.exists():
+            return [front_matter_path, *chapter_paths]
+        return chapter_paths
     if not chapter_paths and not config.chapters:
         book_path = audio_dir / "book.wav"
         if book_path.exists():
@@ -2146,6 +2610,7 @@ def run(config: Config) -> RunPaths:
     markdown_paths = convert_images_to_markdown(None, config, paths, image_paths)
     merge_pages(markdown_paths, paths.raw_book, paths)
     chapters = detect_chapters(markdown_paths, paths)
+    front_matter = detect_front_matter_section(markdown_paths, chapters, paths)
 
     final_page_paths = clean_markdown_pages(None, config, paths, markdown_paths)
     if not config.raw_ocr:
@@ -2155,6 +2620,7 @@ def run(config: Config) -> RunPaths:
     audiobook_text = write_chapter_texts(
         final_page_paths,
         chapters,
+        front_matter,
         paths.audiobook_text,
         paths.chapter_texts,
         paths,
