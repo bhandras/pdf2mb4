@@ -30,7 +30,7 @@ audio_chunks/      generated WAV chunks
 book.md            merged raw OCR Markdown
 cleaned_book.md    merged narration-cleaned Markdown
 audiobook_text.md  chapter-aware text used for speech synthesis
-chapters.json      detected chapter starts and rejected candidates
+chapters.json      detected chapters, front/back bounds, and section headings
 audiobook.wav      final concatenated audiobook
 audiobook.m4b      optional chapterized audiobook package
 config.json        effective run configuration
@@ -166,7 +166,8 @@ When chapter text contains Markdown section headings, M4B packaging adds those
 headings as additional navigation markers inside the chapter. These section
 marker timestamps are estimated from text position within the generated WAV; for
 exact subchapter timings, regenerate audio as smaller section-level files before
-packaging.
+packaging. The detected headings are also written to `chapters.json` under
+`section_headings` so you can audit what will become M4B navigation.
 
 Intro WAV files can be prepended before chapter 1:
 

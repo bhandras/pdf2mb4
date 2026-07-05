@@ -2220,14 +2220,15 @@ def include_m4b_section_heading(title: str, track_title: str, config: Config) ->
         return False
     if normalized == normalize_match_text(track_title):
         return False
-    if config.pdf and normalized in {
-        normalize_match_text(config.pdf.stem),
-        normalize_match_text(config.pdf.stem.replace("_", " ")),
-    }:
-        return False
+    if config.pdf:
+        pdf_title = normalize_match_text(config.pdf.stem.replace("_", " "))
+        if normalized == pdf_title or normalized in pdf_title:
+            return False
     if normalized in {"behavior", "approach", "behavior approach", "index"}:
         return False
     if "|" in title or "/" in title:
+        return False
+    if title.endswith(".") or len(title) > 90:
         return False
     return len(normalized) >= 4
 
@@ -2237,15 +2238,16 @@ def m4b_heading_key(title: str) -> str:
     return re.sub(r"^\d+\s+", "", normalized).strip()
 
 
-def m4b_track_markers(track: AudioTrack, config: Config) -> list[tuple[int, str]]:
-    markers: list[tuple[int, str]] = [(0, track.title)]
-    if not track.text_path or not track.text_path.exists() or track.duration_ms <= 0:
-        return markers
+def section_headings_for_text(
+    text_path: Path, track_title: str, config: Config
+) -> list[dict[str, object]]:
+    if not text_path.exists():
+        return []
 
-    text = track.text_path.read_text(encoding="utf-8", errors="ignore")
+    text = text_path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines()
     total_chars = max(len(normalize_for_audio(text)), 1)
-    seen_titles = {normalize_match_text(track.title)}
+    seen_titles = {normalize_match_text(track_title)}
     heading_counts: dict[str, int] = {}
     for line in lines:
         heading = markdown_heading_title(line)
@@ -2253,21 +2255,42 @@ def m4b_track_markers(track: AudioTrack, config: Config) -> list[tuple[int, str]
             key = m4b_heading_key(heading)
             heading_counts[key] = heading_counts.get(key, 0) + 1
 
+    sections: list[dict[str, object]] = []
     chars_before = 0
 
-    for line in lines:
+    for line_number, line in enumerate(lines, start=1):
         heading = markdown_heading_title(line)
-        if heading and include_m4b_section_heading(heading, track.title, config):
+        if heading and include_m4b_section_heading(heading, track_title, config):
             normalized_heading = normalize_match_text(heading)
             repeated_page_heading = heading_counts.get(m4b_heading_key(heading), 0) > 1
             if normalized_heading not in seen_titles and not repeated_page_heading:
-                offset = round(chars_before * track.duration_ms / total_chars)
-                if 1_000 <= offset <= track.duration_ms - 1_000:
-                    markers.append((offset, heading))
-                    seen_titles.add(normalized_heading)
+                relative_position = chars_before / total_chars
+                sections.append(
+                    {
+                        "title": heading,
+                        "line": line_number,
+                        "char_offset": chars_before,
+                        "relative_position": round(relative_position, 6),
+                    }
+                )
+                seen_titles.add(normalized_heading)
 
         line_text = plain_markdown_line(line)
         chars_before += len(line_text) + 1
+
+    return sections
+
+
+def m4b_track_markers(track: AudioTrack, config: Config) -> list[tuple[int, str]]:
+    markers: list[tuple[int, str]] = [(0, track.title)]
+    if not track.text_path or not track.text_path.exists() or track.duration_ms <= 0:
+        return markers
+
+    for section in section_headings_for_text(track.text_path, track.title, config):
+        relative_position = float(section["relative_position"])
+        offset = round(relative_position * track.duration_ms)
+        if 1_000 <= offset <= track.duration_ms - 1_000:
+            markers.append((offset, str(section["title"])))
 
     markers.sort(key=lambda marker: marker[0])
     deduped: list[tuple[int, str]] = []
@@ -2276,6 +2299,69 @@ def m4b_track_markers(track: AudioTrack, config: Config) -> list[tuple[int, str]
             continue
         deduped.append((offset, title))
     return deduped
+
+
+def detect_section_headings(
+    paths: RunPaths,
+    config: Config,
+    chapters: list[Chapter],
+    front_matter: FrontMatterSection | None,
+) -> list[dict[str, object]]:
+    log_event(paths, "stage_started", stage="detect_section_headings")
+    detected: list[dict[str, object]] = []
+
+    front_matter_path = paths.chapter_texts / "front_matter.md"
+    if front_matter and front_matter_path.exists():
+        sections = section_headings_for_text(front_matter_path, front_matter.title, config)
+        detected.append(
+            {
+                "type": "front_matter",
+                "title": front_matter.title,
+                "file": str(front_matter_path),
+                "sections": sections,
+            }
+        )
+
+    for chapter in chapters:
+        chapter_file = paths.chapter_texts / f"chapter_{chapter.number:03d}.md"
+        if not chapter_file.exists():
+            continue
+        sections = section_headings_for_text(
+            chapter_file, chapter_heading(chapter), config
+        )
+        detected.append(
+            {
+                "type": "chapter",
+                "number": chapter.number,
+                "title": chapter.title,
+                "file": str(chapter_file),
+                "sections": sections,
+            }
+        )
+
+    if not chapters and paths.audiobook_text.exists():
+        title = config.pdf.stem.replace("_", " ") if config.pdf else "Audiobook"
+        sections = section_headings_for_text(paths.audiobook_text, title, config)
+        detected.append(
+            {
+                "type": "book",
+                "title": title,
+                "file": str(paths.audiobook_text),
+                "sections": sections,
+            }
+        )
+
+    total_sections = sum(len(group["sections"]) for group in detected)
+    update_chapter_metadata(paths, section_headings=detected)
+    print(f"Detected {total_sections} section heading(s).")
+    log_event(
+        paths,
+        "stage_completed",
+        stage="detect_section_headings",
+        groups=len(detected),
+        sections=total_sections,
+    )
+    return detected
 
 
 def m4b_escape(value: str) -> str:
@@ -2782,6 +2868,7 @@ def run(config: Config) -> RunPaths:
         paths.chapter_texts,
         paths,
     )
+    detect_section_headings(paths, config, chapters, front_matter)
 
     chapter_audio_paths: list[Path] = []
     if not config.text_only:
