@@ -263,6 +263,7 @@ class AudioTrack:
     title: str
     path: Path
     duration_ms: int
+    text_path: Path | None = None
 
 
 def parse_chapter_selection(value: str | None) -> tuple[int, ...]:
@@ -1186,6 +1187,24 @@ def record_front_matter_metadata(
     )
 
 
+def update_chapter_metadata(paths: RunPaths, **fields: object) -> None:
+    try:
+        payload = json.loads(paths.chapters.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {}
+
+    for key, value in fields.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+
+    paths.chapters.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def detect_front_matter_section(
     markdown_paths: Iterable[Path], chapters: list[Chapter], paths: RunPaths
 ) -> FrontMatterSection | None:
@@ -1237,6 +1256,46 @@ def detect_front_matter_section(
     return front_matter
 
 
+def detect_narration_stop_page(
+    markdown_paths: Iterable[Path], chapters: list[Chapter], paths: RunPaths
+) -> int | None:
+    log_event(paths, "stage_started", stage="detect_narration_stop")
+    start_after = min((chapter.page for chapter in chapters), default=1)
+    stop_page = None
+    stop_title = None
+
+    for markdown_path in sorted(markdown_paths):
+        page = page_number_from_path(markdown_path)
+        if page <= start_after:
+            continue
+
+        lines = page_opener_lines(markdown_path)
+        if not lines:
+            continue
+        first_line = normalize_match_text(lines[0])
+        if first_line == "index":
+            stop_page = page
+            stop_title = "Index"
+            break
+
+    update_chapter_metadata(
+        paths,
+        narration_stop_page=stop_page,
+        narration_stop_title=stop_title,
+    )
+    if stop_page:
+        print(f"Detected audiobook stop before page {stop_page}: {stop_title}.")
+    log_event(
+        paths,
+        "stage_completed",
+        stage="detect_narration_stop",
+        detected=stop_page is not None,
+        page=stop_page,
+        title=stop_title,
+    )
+    return stop_page
+
+
 def strip_leading_chapter_heading(text: str, chapter: Chapter) -> str:
     lines = text.splitlines()
 
@@ -1276,10 +1335,7 @@ def strip_leading_chapter_heading(text: str, chapter: Chapter) -> str:
                 candidate == title
                 or title in candidate
                 or (title.endswith(candidate) and len(candidate) >= 6)
-                or (
-                    title.startswith(candidate)
-                    and len(candidate) >= max(8, int(len(title) * 0.7))
-                )
+                or (title.startswith(candidate) and len(candidate) >= 12)
                 or word_coverage >= 0.85
             ):
                 consumed = index + 1
@@ -1384,22 +1440,15 @@ def selected_audio_text_paths(
 
 
 def strip_leading_section_heading(text: str, title: str) -> str:
-    lines = text.splitlines()
-    while lines and not lines[0].strip():
-        lines.pop(0)
-
-    if lines and normalize_match_text(lines[0]) == normalize_match_text(title):
-        lines.pop(0)
-
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    return "\n".join(lines).strip()
+    sentinel = Chapter(number=0, page=0, title=title, source_file="", raw_heading="")
+    return strip_leading_chapter_heading(text, sentinel)
 
 
 def write_chapter_texts(
     page_paths: list[Path],
     chapters: list[Chapter],
     front_matter: FrontMatterSection | None,
+    stop_page: int | None,
     output_path: Path,
     chapter_dir: Path,
     paths: RunPaths,
@@ -1410,10 +1459,13 @@ def write_chapter_texts(
         stage="write_chapter_texts",
         chapters=len(chapters),
         front_matter=front_matter.title if front_matter else None,
+        stop_page=stop_page,
         output=str(output_path),
     )
     pages_by_number = {page_number_from_path(path): path for path in page_paths}
-    sorted_pages = sorted(pages_by_number)
+    sorted_pages = [
+        page for page in sorted(pages_by_number) if stop_page is None or page < stop_page
+    ]
 
     if not chapters:
         for stale_chapter in chapter_dir.glob("chapter_*.md"):
@@ -1440,6 +1492,7 @@ def write_chapter_texts(
             chapters=0,
             front_matter=front_matter.title if front_matter else None,
             start_page=start_page,
+            stop_page=stop_page,
             book_level_audio=True,
             output=str(output_path),
         )
@@ -1458,8 +1511,7 @@ def write_chapter_texts(
         body_parts = []
         for page in front_pages:
             text = pages_by_number[page].read_text(encoding="utf-8").strip()
-            if page == front_matter.page:
-                text = strip_leading_section_heading(text, front_matter.title)
+            text = strip_leading_section_heading(text, front_matter.title)
             if text:
                 body_parts.append(text)
         front_text = f"{front_matter.title}\n\n" + "\n\n".join(body_parts).strip()
@@ -1479,8 +1531,7 @@ def write_chapter_texts(
         body_parts = []
         for page in section_pages:
             text = pages_by_number[page].read_text(encoding="utf-8").strip()
-            if page == chapter.page:
-                text = strip_leading_chapter_heading(text, chapter)
+            text = strip_leading_chapter_heading(text, chapter)
             if text:
                 body_parts.append(text)
 
@@ -1498,6 +1549,7 @@ def write_chapter_texts(
         stage="write_chapter_texts",
         chapters=len(chapters),
         front_matter=front_matter.title if front_matter else None,
+        stop_page=stop_page,
         chapter_files=len(chapter_parts),
         output=str(output_path),
     )
@@ -2131,6 +2183,17 @@ def chapter_number_from_audio_path(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def text_path_for_audio_path(paths: RunPaths, audio_path: Path) -> Path | None:
+    chapter_number = chapter_number_from_audio_path(audio_path)
+    if chapter_number is not None:
+        return paths.chapter_texts / f"chapter_{chapter_number:03d}.md"
+    if audio_path.stem == "front_matter":
+        return paths.chapter_texts / "front_matter.md"
+    if audio_path.stem == "book":
+        return paths.audiobook_text
+    return None
+
+
 def m4b_chapter_title(chapter_number: int, chapters: list[Chapter], config: Config) -> str:
     for chapter in chapters:
         if chapter.number == chapter_number:
@@ -2139,6 +2202,80 @@ def m4b_chapter_title(chapter_number: int, chapters: list[Chapter], config: Conf
     if chapter_number == 1 and not chapters and config.pdf:
         return config.pdf.stem.replace("_", " ")
     return f"Chapter {chapter_number}"
+
+
+def markdown_heading_title(line: str) -> str | None:
+    match = re.match(r"^\s*#{1,6}\s+(?P<title>.+?)\s*#*\s*$", line)
+    if not match:
+        return None
+    title = clean_title(plain_markdown_line(match.group("title")))
+    return title or None
+
+
+def include_m4b_section_heading(title: str, track_title: str, config: Config) -> bool:
+    normalized = normalize_match_text(title)
+    if not normalized:
+        return False
+    if re.match(r"^\d{1,4}[.)]?\s+\S+", title.strip()):
+        return False
+    if normalized == normalize_match_text(track_title):
+        return False
+    if config.pdf and normalized in {
+        normalize_match_text(config.pdf.stem),
+        normalize_match_text(config.pdf.stem.replace("_", " ")),
+    }:
+        return False
+    if normalized in {"behavior", "approach", "behavior approach", "index"}:
+        return False
+    if "|" in title or "/" in title:
+        return False
+    return len(normalized) >= 4
+
+
+def m4b_heading_key(title: str) -> str:
+    normalized = normalize_match_text(title)
+    return re.sub(r"^\d+\s+", "", normalized).strip()
+
+
+def m4b_track_markers(track: AudioTrack, config: Config) -> list[tuple[int, str]]:
+    markers: list[tuple[int, str]] = [(0, track.title)]
+    if not track.text_path or not track.text_path.exists() or track.duration_ms <= 0:
+        return markers
+
+    text = track.text_path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    total_chars = max(len(normalize_for_audio(text)), 1)
+    seen_titles = {normalize_match_text(track.title)}
+    heading_counts: dict[str, int] = {}
+    for line in lines:
+        heading = markdown_heading_title(line)
+        if heading:
+            key = m4b_heading_key(heading)
+            heading_counts[key] = heading_counts.get(key, 0) + 1
+
+    chars_before = 0
+
+    for line in lines:
+        heading = markdown_heading_title(line)
+        if heading and include_m4b_section_heading(heading, track.title, config):
+            normalized_heading = normalize_match_text(heading)
+            repeated_page_heading = heading_counts.get(m4b_heading_key(heading), 0) > 1
+            if normalized_heading not in seen_titles and not repeated_page_heading:
+                offset = round(chars_before * track.duration_ms / total_chars)
+                if 1_000 <= offset <= track.duration_ms - 1_000:
+                    markers.append((offset, heading))
+                    seen_titles.add(normalized_heading)
+
+        line_text = plain_markdown_line(line)
+        chars_before += len(line_text) + 1
+
+    markers.sort(key=lambda marker: marker[0])
+    deduped: list[tuple[int, str]] = []
+    for offset, title in markers:
+        if deduped and offset - deduped[-1][0] < 1_000:
+            continue
+        deduped.append((offset, title))
+    return deduped
 
 
 def m4b_escape(value: str) -> str:
@@ -2158,15 +2295,25 @@ def write_m4b_metadata(
     tracks: list[AudioTrack],
     include_chapters: bool,
 ) -> None:
-    start_ms = 0
     lines = [
         ";FFMETADATA1",
         f"title={m4b_escape(config.pdf.stem.replace('_', ' ') if config.pdf else 'Audiobook')}",
         "genre=Audiobook",
     ]
     if include_chapters:
+        markers: list[tuple[int, str]] = []
+        track_start_ms = 0
         for track in tracks:
-            end_ms = max(start_ms + track.duration_ms, start_ms + 1)
+            for offset_ms, title in m4b_track_markers(track, config):
+                markers.append((track_start_ms + offset_ms, title))
+            track_start_ms += track.duration_ms
+
+        total_duration_ms = max(track_start_ms, 1)
+        for index, (start_ms, title) in enumerate(markers):
+            next_start = (
+                markers[index + 1][0] if index + 1 < len(markers) else total_duration_ms
+            )
+            end_ms = max(next_start, start_ms + 1)
             lines.extend(
                 [
                     "",
@@ -2174,10 +2321,9 @@ def write_m4b_metadata(
                     "TIMEBASE=1/1000",
                     f"START={start_ms}",
                     f"END={end_ms}",
-                    f"title={m4b_escape(track.title)}",
+                    f"title={m4b_escape(title)}",
                 ]
             )
-            start_ms = end_ms
     paths.m4b_metadata.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2244,7 +2390,9 @@ def build_m4b(
         title = pretty_title_from_path(intro_wav)
         if len(config.intro_wavs) > 1:
             title = f"Intro {index}: {title}"
-        tracks.append(AudioTrack(title=title, path=intro_wav, duration_ms=wav_duration_ms(intro_wav)))
+        tracks.append(
+            AudioTrack(title=title, path=intro_wav, duration_ms=wav_duration_ms(intro_wav))
+        )
 
     for chapter_wav in chapter_audio_paths:
         chapter_number = chapter_number_from_audio_path(chapter_wav)
@@ -2253,7 +2401,14 @@ def build_m4b(
             if chapter_number is not None
             else pretty_title_from_path(chapter_wav)
         )
-        tracks.append(AudioTrack(title=title, path=chapter_wav, duration_ms=wav_duration_ms(chapter_wav)))
+        tracks.append(
+            AudioTrack(
+                title=title,
+                path=chapter_wav,
+                duration_ms=wav_duration_ms(chapter_wav),
+                text_path=text_path_for_audio_path(paths, chapter_wav),
+            )
+        )
 
     if not tracks:
         raise RuntimeError("No audio tracks were provided for M4B packaging.")
@@ -2611,6 +2766,7 @@ def run(config: Config) -> RunPaths:
     merge_pages(markdown_paths, paths.raw_book, paths)
     chapters = detect_chapters(markdown_paths, paths)
     front_matter = detect_front_matter_section(markdown_paths, chapters, paths)
+    stop_page = detect_narration_stop_page(markdown_paths, chapters, paths)
 
     final_page_paths = clean_markdown_pages(None, config, paths, markdown_paths)
     if not config.raw_ocr:
@@ -2621,6 +2777,7 @@ def run(config: Config) -> RunPaths:
         final_page_paths,
         chapters,
         front_matter,
+        stop_page,
         paths.audiobook_text,
         paths.chapter_texts,
         paths,

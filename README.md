@@ -49,11 +49,12 @@ also derive chapters from an early contents page with numbered entries such as
 narration chapter markers even when the cleanup stage removes or normalizes
 them. It also looks for early narratable front matter such as a foreword,
 preface, introduction, prologue, or author note, and drops cover, copyright,
-contents, and other pages before that point from the audiobook text. The cleaned
-page files are also repaired from the validated chapter list so chapter titles
-remain visible during audits. If no chapters are detected, the whole narration
-is synthesized as one book-level WAV and the M4B is packaged without chapter
-markers.
+contents, and other pages before that point from the audiobook text. When an
+Index section is detected after the book body, narration stops before it so
+index pages and trailing ads are not read aloud. The cleaned page files are also
+repaired from the validated chapter list so chapter titles remain visible during
+audits. If no chapters are detected, the whole narration is synthesized as one
+book-level WAV and the M4B is packaged without chapter markers.
 
 The cost report uses actual token usage returned by text/vision API calls and a
 small rate table sourced from OpenAI's published pricing page. It separates the
@@ -160,6 +161,12 @@ uv run make_audiobook.py book.pdf \
 The M4B is written to `output/book/audiobook.m4b`. By default, the first
 rendered PDF page is attached as the cover. Override it with `--cover cover.jpg`,
 or disable cover art with `--no-cover`.
+
+When chapter text contains Markdown section headings, M4B packaging adds those
+headings as additional navigation markers inside the chapter. These section
+marker timestamps are estimated from text position within the generated WAV; for
+exact subchapter timings, regenerate audio as smaller section-level files before
+packaging.
 
 Intro WAV files can be prepended before chapter 1:
 
